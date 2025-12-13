@@ -67,6 +67,14 @@ class Example:
         builder = newton.ModelBuilder(up_axis=newton.Axis.Z)
         newton.solvers.SolverMuJoCo.register_custom_attributes(builder)
 
+        # --- Contact tuning for the ground (MuJoCo uses ke/kd too) ---
+        ground_cfg = newton.ModelBuilder.ShapeConfig(
+            ke=2.0e3,     # contact stiffness (normal “spring”)
+            kd=2.0e4,     # contact damping   (normal “damper”)
+            mu=1.0,       # friction coefficient
+            thickness=1e-4,  # small collision “skin” (optional)
+        )
+
         builder.add_ground_plane()
 
         builder.add_urdf(
@@ -91,8 +99,8 @@ class Example:
 
         # Drive PD (target position for wheel spin)
         # Keep these fairly low to avoid chatter; tune as needed.
-        self.drive_kp = 10.0
-        self.drive_kd = 1.0
+        self.drive_kp =  0.0 
+        self.drive_kd = 10.0
         for dof in self.drive_dofs:
             builder.joint_target_ke[dof] = self.drive_kp
             builder.joint_target_kd[dof] = self.drive_kd
