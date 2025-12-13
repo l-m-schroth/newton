@@ -75,7 +75,7 @@ class Example:
             thickness=1e-4,  # small collision “skin” (optional)
         )
 
-        builder.add_ground_plane()
+        builder.add_ground_plane(cfg=ground_cfg)
 
         builder.add_urdf(
             newton.examples.get_asset("racecar/racecar.urdf"),
@@ -107,6 +107,16 @@ class Example:
 
         # Finalize and create solver
         self.model = builder.finalize()
+
+        # todo much simpler, assign an array here that sets all values to 1
+        condim_np = self.model.mujoco.condim.numpy()
+        condim_np[:] = 1
+        self.model.mujoco.condim = wp.array(
+            condim_np,
+            dtype=self.model.mujoco.condim.dtype,
+            device=self.model.mujoco.condim.device,
+        )
+        print(self.model.mujoco.condim.numpy()) # prints [3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3]
         self.solver = newton.solvers.SolverMuJoCo(self.model, njmax=200, nconmax=200)
 
         self.state_0 = self.model.state()
