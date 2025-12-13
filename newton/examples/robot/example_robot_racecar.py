@@ -17,11 +17,15 @@
 # Example Robot Racecar
 #
 # Loads a URDF racecar, drops it on a flat plane, and allows simple
-# keyboard control. Use I/K for throttle / brake and J/L for steering.
-# MuJoCo Warp is used for dynamics integration.
+# keyboard control:
+#   I / K : increase / decrease desired drive velocity (wheel spin)
+#   J / L : steering left / right
+#
+# Wheels are controlled with target POSITION (integrated wheel angle) and a
+# low-level PD controller (joint_target_ke/kd).
+# Steering is also controlled with target POSITION and PD.
 #
 # Command: python -m newton.examples robot_racecar
-#
 ###########################################################################
 
 from __future__ import annotations
@@ -32,6 +36,21 @@ import warp as wp
 
 import newton
 import newton.examples
+
+
+# Hardcoded actuated joints for racecar.urdf (exact URDF joint names).
+DRIVE_JOINTS = [
+    "left_rear_wheel_joint",
+    "right_rear_wheel_joint",
+    # Uncomment for AWD:
+    # "left_front_wheel_joint",
+    # "right_front_wheel_joint",
+]
+
+STEER_JOINTS = [
+    "left_steering_hinge_joint",
+    "right_steering_hinge_joint",
+]
 
 
 class Example:
@@ -50,7 +69,6 @@ class Example:
 
         builder.add_ground_plane()
 
-        # load the URDF and place it just above the plane
         builder.add_urdf(
             newton.examples.get_asset("racecar/racecar.urdf"),
             xform=wp.transform(wp.vec3(0.0, 0.0, 0.25), wp.quat_identity()),
@@ -58,6 +76,28 @@ class Example:
             enable_self_collisions=False,
         )
 
+        # Resolve joint-name -> DOF indices on the BUILDER (pre-finalize)
+        self.drive_dofs: list[int] = []
+        self.steer_dofs: list[int] = []
+        self._resolve_actuated_dofs_from_names(builder)
+
+        # --- Low-level PD gains (same pattern as humanoid example) ---
+        # Steering PD (target position)
+        self.steer_kp = 50.0
+        self.steer_kd = 5.0
+        for dof in self.steer_dofs:
+            builder.joint_target_ke[dof] = self.steer_kp
+            builder.joint_target_kd[dof] = self.steer_kd
+
+        # Drive PD (target position for wheel spin)
+        # Keep these fairly low to avoid chatter; tune as needed.
+        self.drive_kp = 10.0
+        self.drive_kd = 1.0
+        for dof in self.drive_dofs:
+            builder.joint_target_ke[dof] = self.drive_kp
+            builder.joint_target_kd[dof] = self.drive_kd
+
+        # Finalize and create solver
         self.model = builder.finalize()
         self.solver = newton.solvers.SolverMuJoCo(self.model, njmax=200, nconmax=200)
 
@@ -72,29 +112,92 @@ class Example:
 
         self.viewer.set_model(self.model)
 
-        self.drive_dofs: list[int] = []
-        self.steer_dofs: list[int] = []
-        self._identify_dofs()
-        self.drive_torque = 25.0
-        self.brake_damping = 5.0
+        # --- High-level commands ---
+        # Desired wheel spin velocity (rad/s). Modified by I/K.
+        self.desired_drive_vel = 0.0
+        self.drive_accel = 20.0          # rad/s^2 per second of key-hold
+        self.max_drive_vel = 50.0        # clamp rad/s
+
+        # Steering command (-1..1) from J/L
+        self.steer_cmd = 0.0
         self.max_steer_angle = math.radians(30.0)
 
-        # For simplicity, disable CUDA graph capture in this example since
-        # we modify control arrays on the host each frame.
+        # We integrate wheel angle targets ourselves (position commands).
+        self.drive_target_pos = [0.0 for _ in self.drive_dofs]
+
         self.graph = None
 
-    def _identify_dofs(self):
-        joint_qd_start = self.model.joint_qd_start.numpy()
-        for joint_index, key in enumerate(self.model.joint_key):
-            name = key.lower()
-            dof_start = joint_qd_start[joint_index]
-            dof_end = joint_qd_start[joint_index + 1]
-            if "wheel" in name:
-                self.drive_dofs.extend(range(dof_start, dof_end))
-            elif "steering" in name:
-                self.steer_dofs.extend(range(dof_start, dof_end))
+        print("drive_dofs:", self.drive_dofs)
+        print("steer_dofs:", self.steer_dofs)
 
-    def _apply_keyboard_control(self):
+    def _resolve_actuated_dofs_from_names(self, builder: newton.ModelBuilder):
+        """
+        Map explicit URDF joint names to flattened DOF indices using builder.joint_qd_start.
+        """
+        joint_qd_start = list(builder.joint_qd_start)
+        joint_keys = list(builder.joint_key)
+
+        key_to_joint_id = {key: i for i, key in enumerate(joint_keys)}
+        lower_to_key = {key.lower(): key for key in joint_keys}
+
+        def add_joint_dofs(joint_name: str, out: list[int]):
+            if joint_name in key_to_joint_id:
+                jid = key_to_joint_id[joint_name]
+            else:
+                key = lower_to_key.get(joint_name.lower())
+                if key is None:
+                    available = ", ".join(joint_keys)
+                    raise KeyError(
+                        f"Joint '{joint_name}' not found in builder.joint_key.\n"
+                        f"Available joints: {available}"
+                    )
+                jid = key_to_joint_id[key]
+
+            dof_start = int(joint_qd_start[jid])
+            dof_end = int(joint_qd_start[jid + 1])
+            out.extend(range(dof_start, dof_end))
+
+        for j in DRIVE_JOINTS:
+            add_joint_dofs(j, self.drive_dofs)
+
+        for j in STEER_JOINTS:
+            add_joint_dofs(j, self.steer_dofs)
+
+    def _update_keyboard_inputs(self):
+        """
+        Update high-level commands once per FRAME (not per substep):
+          - desired_drive_vel integrates with I/K
+          - steer_cmd is instantaneous from J/L
+        """
+        inc = 0.0
+        dec = 0.0
+        left = 0.0
+        right = 0.0
+
+        if hasattr(self.viewer, "is_key_down"):
+            inc = 1.0 if self.viewer.is_key_down("i") else 0.0
+            dec = 1.0 if self.viewer.is_key_down("k") else 0.0
+            left = 1.0 if self.viewer.is_key_down("j") else 0.0
+            right = 1.0 if self.viewer.is_key_down("l") else 0.0
+
+        # ramp desired velocity
+        self.desired_drive_vel += (inc - dec) * self.drive_accel * self.frame_dt
+        self.desired_drive_vel = float(wp.clamp(self.desired_drive_vel, -self.max_drive_vel, self.max_drive_vel))
+
+        # instantaneous steering command
+        self.steer_cmd = float(wp.clamp(left - right, -1.0, 1.0))
+
+    def _apply_control_substep(self):
+        """
+        Apply target position/velocity commands for BOTH drive + steering.
+
+        Drive: we integrate wheel angle targets from desired_drive_vel:
+          theta_target += desired_drive_vel * sim_dt
+          q_target_pos = theta_target
+          q_target_vel = desired_drive_vel
+
+        Steering: position target = +/- max_steer_angle, vel target = 0
+        """
         if self.control.joint_f is not None:
             self.control.joint_f.zero_()
         if self.control.joint_target_pos is not None:
@@ -102,51 +205,43 @@ class Example:
         if self.control.joint_target_vel is not None:
             self.control.joint_target_vel.zero_()
 
-        throttle = 0.0
-        steering = 0.0
-        braking = False
+        if self.control.joint_target_pos is None or self.control.joint_target_vel is None:
+            # If these are None, target-position control isn't available in this build.
+            return
 
-        if hasattr(self.viewer, "is_key_down"):
-            throttle += 1.0 if self.viewer.is_key_down("i") else 0.0
-            throttle -= 1.0 if self.viewer.is_key_down("k") else 0.0
-            steering += 1.0 if self.viewer.is_key_down("j") else 0.0
-            steering -= 1.0 if self.viewer.is_key_down("l") else 0.0
-            braking = bool(self.viewer.is_key_down("space"))
+        # --- Drive wheel targets (position-based) ---
+        for i, dof in enumerate(self.drive_dofs):
+            self.drive_target_pos[i] += self.desired_drive_vel * self.sim_dt
 
-        torque = self.drive_torque * throttle
-        if braking:
-            torque -= self.brake_damping
+        target_pos_np = self.control.joint_target_pos.numpy()
+        target_vel_np = self.control.joint_target_vel.numpy()
 
-        if self.control.joint_f is not None:
-            # write via NumPy view since wp.array does not support item assignment
-            joint_f_np = self.control.joint_f.numpy()
-            for dof in self.drive_dofs:
-                joint_f_np[dof] = torque
-            self.control.joint_f = wp.array(joint_f_np, dtype=self.control.joint_f.dtype, device=self.control.joint_f.device)
+        for i, dof in enumerate(self.drive_dofs):
+            target_pos_np[dof] = self.drive_target_pos[i]
+            target_vel_np[dof] = self.desired_drive_vel
 
-        if self.control.joint_target_pos is not None and self.control.joint_target_vel is not None:
-            target_angle = self.max_steer_angle * wp.clamp(steering, -1.0, 1.0)
-            joint_target_pos_np = self.control.joint_target_pos.numpy()
-            joint_target_vel_np = self.control.joint_target_vel.numpy()
-            for dof in self.steer_dofs:
-                joint_target_pos_np[dof] = target_angle
-                joint_target_vel_np[dof] = 0.0
-            self.control.joint_target_pos = wp.array(
-                joint_target_pos_np,
-                dtype=self.control.joint_target_pos.dtype,
-                device=self.control.joint_target_pos.device,
-            )
-            self.control.joint_target_vel = wp.array(
-                joint_target_vel_np,
-                dtype=self.control.joint_target_vel.dtype,
-                device=self.control.joint_target_vel.device,
-            )
+        # --- Steering targets (position-based) ---
+        target_angle = self.max_steer_angle * self.steer_cmd
+        for dof in self.steer_dofs:
+            target_pos_np[dof] = target_angle
+            target_vel_np[dof] = 0.0
+
+        self.control.joint_target_pos = wp.array(
+            target_pos_np,
+            dtype=self.control.joint_target_pos.dtype,
+            device=self.control.joint_target_pos.device,
+        )
+        self.control.joint_target_vel = wp.array(
+            target_vel_np,
+            dtype=self.control.joint_target_vel.dtype,
+            device=self.control.joint_target_vel.device,
+        )
 
     def _simulate_once(self):
         for _ in range(self.sim_substeps):
             self.state_0.clear_forces()
 
-            self._apply_keyboard_control()
+            self._apply_control_substep()
 
             self.viewer.apply_forces(self.state_0)
 
@@ -156,10 +251,10 @@ class Example:
             self.state_0, self.state_1 = self.state_1, self.state_0
 
     def step(self):
-        if self.graph:
-            wp.capture_launch(self.graph)
-        else:
-            self._simulate_once()
+        # Update commands once per frame
+        self._update_keyboard_inputs()
+
+        self._simulate_once()
         self.sim_time += self.frame_dt
 
     def render(self):
