@@ -74,6 +74,7 @@ class FialaTireParams:
     u_max: float
     u_min: float
     rolling_resistance: float
+    width: float
     v_eps: float = 0.1  # m/s, avoid division explosion at low speed
     fz_min: float = 1e-3  # N, ignore near-zero load
 
@@ -131,9 +132,11 @@ def _extract_spatial6(row: np.ndarray) -> np.ndarray:
     raise ValueError(f"Unsupported spatial_vector representation with shape={getattr(row, 'shape', None)}")
 
 
-def _fiala_forces(params: FialaTireParams, *, fz: float, v_x: float, v_y: float, omega: float, r_eff: float) -> tuple[float, float, float]:
+def _fiala_forces(
+    params: FialaTireParams, *, fz: float, v_x: float, v_y: float, omega: float, r_eff: float
+) -> tuple[float, float, float, float]:
     if fz < params.fz_min:
-        return 0.0, 0.0, 0.0
+        return 0.0, 0.0, 0.0, 0.0
 
     denom_vx = max(abs(v_x), params.v_eps)
     ss = (omega * r_eff - v_x) / denom_vx
@@ -161,13 +164,15 @@ def _fiala_forces(params: FialaTireParams, *, fz: float, v_x: float, v_y: float,
         h = 1.0 - (params.c_alpha * abs(tan_alpha)) / (3.0 * u * fz)
         h = float(np.clip(h, 0.0, 1.0))
         f_y = -u * fz * (1.0 - h**3) * _sign(alpha)
+        m_z = u * fz * params.width * (1.0 - h) * (h**3) * _sign(alpha)
     else:
         f_y = -u * fz * _sign(alpha)
+        m_z = 0.0
 
     # Rolling resistance (report eq. 28)
     m_y = -params.rolling_resistance * fz * _sign(omega)
 
-    return f_x, f_y, m_y
+    return f_x, f_y, m_y, m_z
 
 
 @wp.kernel
@@ -326,15 +331,18 @@ class Example:
             u_max=1.0,
             u_min=0.9,
             rolling_resistance=0.001,
+            width=0.235,
         )
 
         rolling_resistance = params_report["rolling_resistance"] * (WHEEL_UNLOADED_RADIUS_M / FIALA_REF_RADIUS_M)
+        width = params_report["width"] * (WHEEL_UNLOADED_RADIUS_M / FIALA_REF_RADIUS_M)
         self.tire_params = FialaTireParams(
             c_slip=params_report["c_slip"] * scale,
             c_alpha=params_report["c_alpha"] * scale,
             u_max=params_report["u_max"],
             u_min=params_report["u_min"],
             rolling_resistance=rolling_resistance,
+            width=width,
         )
 
         self._body_com_np = np.asarray(self.model.body_com.numpy(), dtype=np.float64)
@@ -483,10 +491,10 @@ class Example:
             v_y = float(np.dot(v_origin, y))
 
             r_eff = max(0.2 * wheel.radius, wheel.radius - depth)
-            f_x, f_y, m_y = _fiala_forces(self.tire_params, fz=fz, v_x=v_x, v_y=v_y, omega=omega, r_eff=r_eff)
+            f_x, f_y, m_y, m_z = _fiala_forces(self.tire_params, fz=fz, v_x=v_x, v_y=v_y, omega=omega, r_eff=r_eff)
 
             f_world = (f_x * x) + (f_y * y)
-            tau_world = np.cross(p_c - com_w, f_world) + (m_y * y)
+            tau_world = np.cross(p_c - com_w, f_world) + (m_y * y) + (m_z * z)
 
             forces[wi, :] = f_world.astype(np.float32)
             torques[wi, :] = tau_world.astype(np.float32)
