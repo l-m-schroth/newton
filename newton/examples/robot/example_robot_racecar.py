@@ -22,7 +22,7 @@
 #   J / L : steering left / right
 #
 # Wheels are controlled with target POSITION (integrated wheel angle) and a
-# low-level PD controller (joint_target_ke/kd).
+# low-level PD controller (joint_target_ke/kd), typically ke = 0.
 # Steering is also controlled with target POSITION and PD.
 #
 # Command: python -m newton.examples robot_racecar
@@ -67,6 +67,21 @@ FIALA_REF_FZ_N = 4000.0  # scale stiffnesses relative to a nominal passenger-car
 FIALA_REF_RADIUS_M = 0.3099  # report's unloaded radius (TR-2015-13)
 
 
+def _noop_mjcb_control(_m, _d) -> None:
+    """Sanity-check MuJoCo(-Warp) control callback.
+
+    Prints on every invocation to verify that the callback is actually called
+    (note: with RK4 it will be called multiple times per step).
+    """
+    t0 = None
+    try:
+        # This syncs device->host; OK for a quick sanity check.
+        t0 = float(np.asarray(_d.time.numpy(), dtype=np.float64)[0])
+    except Exception:
+        pass
+    print(f"[mjcb_control] called time={t0} nworld={getattr(_d, 'nworld', None)}")
+
+
 @dataclass(frozen=True)
 class FialaTireParams:
     c_slip: float
@@ -106,6 +121,8 @@ def _normalize(v: np.ndarray, eps: float = 1e-12) -> np.ndarray:
 
 
 def _quat_rotate_xyzw(q: np.ndarray, v: np.ndarray) -> np.ndarray:
+    """ function that rotates a 3D vector around a unit quaternion, for instance mentioned here:
+    https://blog.molecular-matters.com/2013/05/24/a-faster-quaternion-vector-multiplication"""
     q = np.asarray(q, dtype=np.float64)
     v = np.asarray(v, dtype=np.float64)
     q_xyz = q[:3]
@@ -115,6 +132,7 @@ def _quat_rotate_xyzw(q: np.ndarray, v: np.ndarray) -> np.ndarray:
 
 
 def _extract_xform7(row: np.ndarray) -> np.ndarray:
+    """formats a rigid transform as a flat 7-vector [px, py, pz, qx, qy, qz, qw]"""
     row = np.asarray(row)
     if row.shape[-1] == 7:
         return row
@@ -124,6 +142,7 @@ def _extract_xform7(row: np.ndarray) -> np.ndarray:
 
 
 def _extract_spatial6(row: np.ndarray) -> np.ndarray:
+    """formats velocity to a flat 6-vector [vx, vy, vz, wx, wy, wz]"""
     row = np.asarray(row)
     if row.shape[-1] == 6:
         return row
@@ -135,6 +154,8 @@ def _extract_spatial6(row: np.ndarray) -> np.ndarray:
 def _fiala_forces(
     params: FialaTireParams, *, fz: float, v_x: float, v_y: float, omega: float, r_eff: float
 ) -> tuple[float, float, float, float]:
+    """computes longitudinal, lateral forces, self-aligning moment and rolling resistance. 
+    For the formulas, see for instance:https://sbel.wisc.edu/wp-content/uploads/sites/569/2018/05/TR-2015-13.pdf"""    
     if fz < params.fz_min:
         return 0.0, 0.0, 0.0, 0.0
 
@@ -150,7 +171,7 @@ def _fiala_forces(
     u = params.u_max - (params.u_max - params.u_min) * ss_alpha
 
     # Longitudinal force (report eqs. 22-24, with |Ss| in the 1/S term for physical symmetry)
-    s_crit = (u * fz) / (2.0 * params.c_slip) if params.c_slip > 0.0 else 0.0
+    s_crit = (u * fz) / (2.0 * params.c_slip) 
     if abs(ss) <= s_crit:
         f_x = params.c_slip * ss
     else:
@@ -159,7 +180,7 @@ def _fiala_forces(
         f_x = _sign(ss) * (fx1 - fx2)
 
     # Lateral force (report eqs. 25-27)
-    alpha_crit = math.atan((3.0 * u * fz) / params.c_alpha) if params.c_alpha > 0.0 else 0.0
+    alpha_crit = math.atan((3.0 * u * fz) / params.c_alpha) 
     if abs(alpha) <= alpha_crit:
         h = 1.0 - (params.c_alpha * abs(tan_alpha)) / (3.0 * u * fz)
         h = float(np.clip(h, 0.0, 1.0))
@@ -181,7 +202,8 @@ def _apply_wrenches_kernel(
     forces: wp.array(dtype=wp.vec3),
     torques: wp.array(dtype=wp.vec3),
     body_f: wp.array(dtype=wp.spatial_vector),
-):
+):  
+    """Warp kernel for applying generalized forces to bodies"""
     tid = wp.tid()
     body = body_ids[tid]
     if body < 0:
@@ -190,7 +212,7 @@ def _apply_wrenches_kernel(
     t = torques[tid]
     wp.atomic_add(body_f, body, wp.spatial_vector(f, t))
 
-
+# -------- # 
 class Example:
     def __init__(self, viewer, args=None):
         # simulation timing
@@ -254,6 +276,16 @@ class Example:
             device=self.model.mujoco.condim.device,
         )
         self.solver = newton.solvers.SolverMuJoCo(self.model, njmax=200, nconmax=200)
+
+        # Install a dummy MuJoCo-Warp control callback (mjcb_control) to verify that the
+        # callback plumbing matches MuJoCo-C (it will be invoked during forward dynamics
+        # and at each RK4 stage).
+        try:
+            import mujoco_warp
+        except Exception:
+            mujoco_warp = None
+        if mujoco_warp is not None and hasattr(mujoco_warp, "mjcb_control"):
+            mujoco_warp.mjcb_control = _noop_mjcb_control
 
         self.state_0 = self.model.state()
         self.state_1 = self.model.state()
@@ -326,8 +358,8 @@ class Example:
         scale = fz_nom / FIALA_REF_FZ_N
 
         params_report = dict(
-            c_slip=1_000_000.0,
-            c_alpha=45_836.6236,
+            c_slip=3*1_000_000.0, # just added 3* for quick trial
+            c_alpha=3*45_836.6236, # just added 3* for quick trial
             u_max=1.0,
             u_min=0.9,
             rolling_resistance=0.001,
