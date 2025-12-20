@@ -269,7 +269,7 @@ class Example:
         self._up_dir = (-g / g_mag) if g_mag > 1e-12 else np.array([0.0, 0.0, 1.0], dtype=np.float64)
 
         # Picard settings (MJWarp extension, see mujoco_warp.Model.opt).
-        self.picard_iterations = int(os.getenv("NEWTON_PICARD_ITERS", "4"))
+        self.picard_iterations = int(os.getenv("NEWTON_PICARD_ITERS", "1"))
         self.picard_beta = float(os.getenv("NEWTON_PICARD_BETA", "1.0"))
         self.solver.mjw_model.opt.picard_iterations = max(1, int(self.picard_iterations))
         self.solver.mjw_model.opt.picard_beta = float(np.clip(self.picard_beta, 0.0, 1.0))
