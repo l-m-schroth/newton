@@ -189,7 +189,7 @@ class Example:
         self.fps = 60
         self.frame_dt = 1.0 / self.fps
         self.sim_time = 0.0
-        self.sim_substeps = 8
+        self.sim_substeps = 16 
         self.sim_dt = self.frame_dt / self.sim_substeps
 
         self.viewer = viewer
@@ -244,7 +244,7 @@ class Example:
             self.model,
             njmax=200,
             nconmax=200,
-            integrator="rk4",
+            integrator="euler", 
             disable_contacts=False,
             use_mujoco_contacts=True,
         )
@@ -269,7 +269,7 @@ class Example:
         self._up_dir = (-g / g_mag) if g_mag > 1e-12 else np.array([0.0, 0.0, 1.0], dtype=np.float64)
 
         # Picard settings (MJWarp extension, see mujoco_warp.Model.opt).
-        self.picard_iterations = int(os.getenv("NEWTON_PICARD_ITERS", "1"))
+        self.picard_iterations = int(os.getenv("NEWTON_PICARD_ITERS", "10"))
         self.picard_beta = float(os.getenv("NEWTON_PICARD_BETA", "1.0"))
         self.solver.mjw_model.opt.picard_iterations = max(1, int(self.picard_iterations))
         self.solver.mjw_model.opt.picard_beta = float(np.clip(self.picard_beta, 0.0, 1.0))
@@ -283,6 +283,11 @@ class Example:
         # Steering command (-1..1) from J/L
         self.steer_cmd = 0.0
         self.max_steer_angle = math.radians(30.0)
+
+        # Optional constant-command overrides (useful for headless runs)
+        self._drive_vel_override = getattr(args, "drive_vel", None) if args is not None else None
+        self._steer_cmd_override = getattr(args, "steer_cmd", None) if args is not None else None
+        self._picard_log_enabled_cli = getattr(args, "picard_log", None) if args is not None else None
 
         # We integrate wheel angle targets ourselves (position commands).
         self.drive_target_pos = [0.0 for _ in self.drive_dofs]
@@ -347,8 +352,8 @@ class Example:
         scale = fz_nom / FIALA_REF_FZ_N
 
         params_report = dict(
-            c_slip=3*1_000_000.0, # just added 3* for quick trial
-            c_alpha=3*45_836.6236, # just added 3* for quick trial
+            c_slip=1_000_000.0,
+            c_alpha=45_836.6236,
             u_max=1.0,
             u_min=0.9,
             rolling_resistance=0.001,
@@ -489,33 +494,43 @@ class Example:
             )
 
     def _configure_mujoco_tire_contact(self) -> None:
-        """Configure MuJoCo contact to be normal-only (condim=1, friction=0) for wheel/ground."""
-        wheel_geoms: set[int] = set()
-        for w in self.wheels:
-            wheel_geoms.update(int(g) for g in w.mjc_geom_ids.tolist())
+        """Configure MuJoCo contact to be normal-only (condim=1, friction=0) for all geoms.
 
-        ground_geoms = np.nonzero(self._mjc_geom_bodyid_np == 0)[0].tolist()
-        target_geoms = sorted(set(ground_geoms).union(wheel_geoms))
-        if not target_geoms:
-            return
+        This matches the previous "old" racecar example behavior where `condim` was set
+        globally and tangential forces were applied exclusively via the tire model.
+        """
+
+        if hasattr(self.model, "mujoco") and hasattr(self.model.mujoco, "condim") and self.model.mujoco.condim is not None:
+            condim_np = np.asarray(self.model.mujoco.condim.numpy(), dtype=np.int32)
+            condim_np[:] = 1
+            self.model.mujoco.condim = wp.array(condim_np, dtype=wp.int32, device=self.model.device)
 
         condim = np.asarray(self.solver.mjw_model.geom_condim.numpy(), dtype=np.int32)
-        condim[target_geoms] = 1
+        condim[:] = 1
         self.solver.mjw_model.geom_condim = wp.array(condim, dtype=wp.int32, device=self.model.device)
 
         friction = np.asarray(self.solver.mjw_model.geom_friction.numpy(), dtype=np.float32)
         if friction.ndim == 3:
-            friction[0, target_geoms, :] = 0.0
+            friction[:, :, :] = 0.0
         elif friction.ndim == 2:
-            friction[target_geoms, :] = 0.0
+            friction[:, :] = 0.0
         else:
             raise ValueError(f"Unexpected geom_friction shape: {friction.shape}")
         self.solver.mjw_model.geom_friction = wp.array(friction, dtype=wp.vec3, device=self.model.device)
 
     def _init_picard_logging(self) -> None:
-        self.picard_log_enabled = os.getenv("NEWTON_PICARD_LOG", "1").strip() not in ("", "0", "false", "False")
+        env_enabled = os.getenv("NEWTON_PICARD_LOG", "1").strip() not in ("", "0", "false", "False")
+        cli_enabled = getattr(self, "_picard_log_enabled_cli", None)
+        if cli_enabled is None:
+            self.picard_log_enabled = env_enabled
+        else:
+            self.picard_log_enabled = bool(cli_enabled)
+
         self.picard_log_path = os.getenv("NEWTON_PICARD_LOG_PATH", "racecar_picard_log.npz").strip()
         self.picard_log_maxlen = int(os.getenv("NEWTON_PICARD_LOG_MAX", "20000"))
+
+        if not self.picard_log_enabled:
+            return
 
         self._picard_log_last_time: float | None = None
         self._picard_log_iter = 0
@@ -523,9 +538,13 @@ class Example:
         self._picard_log_iters: list[int] = []
         self._picard_log_forces: list[np.ndarray] = []
         self._picard_log_torques: list[np.ndarray] = []
+        self._picard_log_f_n: list[np.ndarray] = []
+        self._picard_log_fx: list[np.ndarray] = []
+        self._picard_log_fy: list[np.ndarray] = []
+        self._picard_log_m_roll: list[np.ndarray] = []
+        self._picard_log_m_align: list[np.ndarray] = []
 
-        if self.picard_log_enabled:
-            atexit.register(self._save_picard_log)
+        atexit.register(self._save_picard_log)
 
     def _save_picard_log(self) -> None:
         if not getattr(self, "picard_log_enabled", False):
@@ -544,6 +563,11 @@ class Example:
         iters = np.asarray(self._picard_log_iters, dtype=np.int32)
         forces = np.stack(self._picard_log_forces, axis=0).astype(np.float32)
         torques = np.stack(self._picard_log_torques, axis=0).astype(np.float32)
+        f_n = np.stack(self._picard_log_f_n, axis=0).astype(np.float32)
+        fx = np.stack(self._picard_log_fx, axis=0).astype(np.float32)
+        fy = np.stack(self._picard_log_fy, axis=0).astype(np.float32)
+        m_roll = np.stack(self._picard_log_m_roll, axis=0).astype(np.float32)
+        m_align = np.stack(self._picard_log_m_align, axis=0).astype(np.float32)
         wheel_names = np.asarray([w.joint_name for w in self.wheels], dtype=np.str_)
 
         np.savez(
@@ -552,13 +576,28 @@ class Example:
             iters=iters,
             forces=forces,
             torques=torques,
+            f_n=f_n,
+            fx=fx,
+            fy=fy,
+            m_roll=m_roll,
+            m_align=m_align,
             wheel_names=wheel_names,
             picard_iterations=int(self.picard_iterations),
             picard_beta=float(self.picard_beta),
         )
         print(f"[picard-log] saved {len(times)} entries to {path}", flush=True)
 
-    def _record_picard_iteration(self, d, forces: np.ndarray, torques: np.ndarray) -> None:
+    def _record_picard_iteration(
+        self,
+        d,
+        forces: np.ndarray,
+        torques: np.ndarray,
+        f_n: np.ndarray,
+        fx: np.ndarray,
+        fy: np.ndarray,
+        m_roll: np.ndarray,
+        m_align: np.ndarray,
+    ) -> None:
         if not getattr(self, "picard_log_enabled", False):
             return
 
@@ -567,16 +606,25 @@ class Example:
 
         worldid = 0
         time0 = float(np.asarray(d.time.numpy(), dtype=np.float64)[worldid])
-        if self._picard_log_last_time is None or abs(time0 - self._picard_log_last_time) > 1e-12:
-            self._picard_log_last_time = time0
-            self._picard_log_iter = 0
+        picard_iter = getattr(d, "_picard_iter", None)
+        if picard_iter is not None:
+            self._picard_log_iter = int(picard_iter)
         else:
-            self._picard_log_iter += 1
+            if self._picard_log_last_time is None or abs(time0 - self._picard_log_last_time) > 1e-12:
+                self._picard_log_last_time = time0
+                self._picard_log_iter = 0
+            else:
+                self._picard_log_iter += 1
 
         self._picard_log_times.append(time0)
         self._picard_log_iters.append(int(self._picard_log_iter))
         self._picard_log_forces.append(np.asarray(forces, dtype=np.float32).copy())
         self._picard_log_torques.append(np.asarray(torques, dtype=np.float32).copy())
+        self._picard_log_f_n.append(np.asarray(f_n, dtype=np.float32).copy())
+        self._picard_log_fx.append(np.asarray(fx, dtype=np.float32).copy())
+        self._picard_log_fy.append(np.asarray(fy, dtype=np.float32).copy())
+        self._picard_log_m_roll.append(np.asarray(m_roll, dtype=np.float32).copy())
+        self._picard_log_m_align.append(np.asarray(m_align, dtype=np.float32).copy())
 
     def _apply_tire_wrenches(self, d, forces: np.ndarray, torques: np.ndarray) -> None:
         wp.copy(self._tire_forces_wp, wp.array(forces, dtype=wp.vec3, device=self.model.device))
@@ -608,6 +656,11 @@ class Example:
 
         forces = np.zeros((len(self.wheels), 3), dtype=np.float32)
         torques = np.zeros((len(self.wheels), 3), dtype=np.float32)
+        f_n_arr = np.zeros((len(self.wheels),), dtype=np.float32)
+        fx_arr = np.zeros((len(self.wheels),), dtype=np.float32)
+        fy_arr = np.zeros((len(self.wheels),), dtype=np.float32)
+        m_roll_arr = np.zeros((len(self.wheels),), dtype=np.float32)
+        m_align_arr = np.zeros((len(self.wheels),), dtype=np.float32)
 
         if len(self.wheels) == 0:
             return
@@ -709,22 +762,23 @@ class Example:
                 f_n_total = float(np.sum(fns))
                 other_body = int(contacts[0][4])
 
-                # Wheel kinematics at midpoint
+                # Wheel kinematics
+                #
+                # IMPORTANT: Use COM linear velocity for slip computation.
+                # The Fiala slip ratio/angle formulas below assume *wheel-center* velocity
+                # (not the contact-point velocity, which already contains wheel-spin terms).
+                # The contact point `p_mid` is still used for the torque arm `r x F`.
                 wheel_body = wheel.mjc_body_id
                 com_w = xipos[wheel_body]
                 w_w = cvel[wheel_body, 0:3]
                 v_com_w = cvel[wheel_body, 3:6]
-                v_mid_wheel = v_com_w + np.cross(w_w, p_mid - com_w)
 
                 if other_body == 0:
-                    v_mid_other = np.zeros(3, dtype=np.float64)
+                    v_com_o = np.zeros(3, dtype=np.float64)
                 else:
-                    com_o = xipos[other_body]
-                    w_o = cvel[other_body, 0:3]
                     v_com_o = cvel[other_body, 3:6]
-                    v_mid_other = v_com_o + np.cross(w_o, p_mid - com_o)
 
-                v_rel = v_mid_wheel - v_mid_other
+                v_rel = v_com_w - v_com_o
 
                 # Ensure the aggregated normal points from the other body toward the wheel.
                 if other_body == 0:
@@ -762,14 +816,32 @@ class Example:
 
                 forces[wi, :] = f_world.astype(np.float32)
                 torques[wi, :] = tau_world.astype(np.float32)
+                f_n_arr[wi] = float(f_n_total)
+                fx_arr[wi] = float(f_x)
+                fy_arr[wi] = float(f_y)
+                m_roll_arr[wi] = float(m_roll)
+                m_align_arr[wi] = float(m_z)
 
         if getattr(self, "debug_tire", False):
-            if not (np.isfinite(forces).all() and np.isfinite(torques).all()):
+            if not (
+                np.isfinite(forces).all()
+                and np.isfinite(torques).all()
+                and np.isfinite(f_n_arr).all()
+                and np.isfinite(fx_arr).all()
+                and np.isfinite(fy_arr).all()
+                and np.isfinite(m_roll_arr).all()
+                and np.isfinite(m_align_arr).all()
+            ):
                 print("[tire-debug][WARN] non-finite tire forces/torques; zeroing", flush=True)
                 forces[:, :] = 0.0
                 torques[:, :] = 0.0
+                f_n_arr[:] = 0.0
+                fx_arr[:] = 0.0
+                fy_arr[:] = 0.0
+                m_roll_arr[:] = 0.0
+                m_align_arr[:] = 0.0
 
-        self._record_picard_iteration(d, forces, torques)
+        self._record_picard_iteration(d, forces, torques, f_n_arr, fx_arr, fy_arr, m_roll_arr, m_align_arr)
         self._apply_tire_wrenches(d, forces, torques)
 
     def _update_keyboard_inputs(self):
@@ -795,6 +867,13 @@ class Example:
 
         # instantaneous steering command
         self.steer_cmd = float(wp.clamp(left - right, -1.0, 1.0))
+
+        if self._drive_vel_override is not None:
+            self.desired_drive_vel = float(
+                wp.clamp(float(self._drive_vel_override), -self.max_drive_vel, self.max_drive_vel)
+            )
+        if self._steer_cmd_override is not None:
+            self.steer_cmd = float(wp.clamp(float(self._steer_cmd_override), -1.0, 1.0))
 
     def _apply_control_substep(self):
         """
@@ -873,6 +952,33 @@ class Example:
 
 if __name__ == "__main__":
     parser = newton.examples.create_parser()
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument(
+        "--picard-log",
+        dest="picard_log",
+        action="store_true",
+        default=None,
+        help="Enable Picard `.npz` logging (overrides NEWTON_PICARD_LOG).",
+    )
+    group.add_argument(
+        "--no-picard-log",
+        dest="picard_log",
+        action="store_false",
+        default=None,
+        help="Disable Picard `.npz` logging (overrides NEWTON_PICARD_LOG).",
+    )
+    parser.add_argument(
+        "--drive-vel",
+        type=float,
+        default=None,
+        help="Constant desired wheel spin velocity [rad/s] (overrides I/K).",
+    )
+    parser.add_argument(
+        "--steer-cmd",
+        type=float,
+        default=None,
+        help="Constant steering command in [-1, 1] (overrides J/L).",
+    )
     viewer, args = newton.examples.init(parser)
 
     example = Example(viewer, args)
