@@ -219,7 +219,7 @@ class Example:
 
         builder.add_urdf(
             newton.examples.get_asset("racecar/racecar.urdf"),
-            xform=wp.transform(wp.vec3(0.0, 0.0, 0.25), wp.quat_identity()),
+            xform=wp.transform(wp.vec3(0.0, 0.0, 0.0), wp.quat_identity()),
             floating=True,
             enable_self_collisions=False,
         )
@@ -255,7 +255,7 @@ class Example:
         )
 
         # Euler integrator for 1:1 comparison
-        self.solver = newton.solvers.SolverMuJoCo(self.model, njmax=200, nconmax=200, integrator="euler")
+        self.solver = newton.solvers.SolverMuJoCo(self.model, njmax=200, nconmax=200, integrator="rk4")
 
         self.state_0 = self.model.state()
         self.state_1 = self.model.state()
@@ -288,6 +288,79 @@ class Example:
 
         mujoco_warp.mjcb_control = self._tire_mjcb_control
         mujoco_warp.mjcb_postsolve = None  # ensure Picard loop is disabled
+
+        self._maybe_init_pos_speed(args)
+
+    def _maybe_init_pos_speed(self, args) -> None:
+        if args is None or not getattr(args, "init_pos_speed", False):
+            return
+
+        v0 = 2.0  # m/s, nominal tire model range and within max_drive_vel
+        omega0 = v0 / WHEEL_UNLOADED_RADIUS_M  # rad/s
+
+        joint_qd_np = np.asarray(self.state_0.joint_qd.numpy(), dtype=np.float64)
+
+        # Find the floating base (free) joint dof range and set a forward (world +X) speed.
+        joint_qd_start = np.asarray(self.model.joint_qd_start.numpy(), dtype=np.int32)
+        joint_q_start = np.asarray(self.model.joint_q_start.numpy(), dtype=np.int32)
+        base_dof_start = None
+        for jid in range(len(joint_qd_start) - 1):
+            dof_start = int(joint_qd_start[jid])
+            dof_end = int(joint_qd_start[jid + 1])
+            q_start = int(joint_q_start[jid])
+            q_end = int(joint_q_start[jid + 1])
+            if (dof_end - dof_start) == 6 and (q_end - q_start) == 7:
+                base_dof_start = dof_start
+                break
+
+        if base_dof_start is not None and (base_dof_start + 2) < joint_qd_np.shape[0]:
+            joint_qd_np[base_dof_start + 0] = v0
+            joint_qd_np[base_dof_start + 1] = 0.0
+            joint_qd_np[base_dof_start + 2] = 0.0
+            if (base_dof_start + 5) < joint_qd_np.shape[0]:
+                joint_qd_np[base_dof_start + 3 : base_dof_start + 6] = 0.0
+
+        # Initialize all wheel spin joints to match pure rolling at v0.
+        body_q = np.asarray(self.state_0.body_q.numpy(), dtype=np.float64)
+        chassis_tf = _extract_xform7(body_q[self._chassis_body_id])
+        chassis_q = chassis_tf[3:7]
+        chassis_forward = _normalize(_quat_rotate_xyzw(chassis_q, np.array([1.0, 0.0, 0.0], dtype=np.float64)))
+        chassis_up = _normalize(_quat_rotate_xyzw(chassis_q, np.array([0.0, 0.0, 1.0], dtype=np.float64)))
+
+        for wheel in self.wheels:
+            wheel_tf = _extract_xform7(body_q[wheel.body_id])
+            wheel_q = wheel_tf[3:7]
+
+            axis_world = _normalize(_quat_rotate_xyzw(wheel_q, wheel.axis_child))
+            z = chassis_up
+            x = _normalize(np.cross(axis_world, z))
+            if np.linalg.norm(x) < 1e-8:
+                x = _normalize(chassis_forward - np.dot(chassis_forward, z) * z)
+            if np.dot(x, chassis_forward) < 0.0:
+                axis_world = -axis_world
+                x = -x
+            y = _normalize(np.cross(z, x))
+
+            spin_proj = float(np.dot(y, axis_world))
+            if abs(spin_proj) < 1e-8:
+                joint_qd_np[wheel.dof_id] = omega0
+            else:
+                joint_qd_np[wheel.dof_id] = omega0 / spin_proj
+
+        wp.copy(
+            self.state_0.joint_qd,
+            wp.array(joint_qd_np, dtype=self.state_0.joint_qd.dtype, device=self.model.device),
+        )
+        wp.copy(self.state_1.joint_q, self.state_0.joint_q)
+        wp.copy(self.state_1.joint_qd, self.state_0.joint_qd)
+
+        newton.eval_fk(self.model, self.state_0.joint_q, self.state_0.joint_qd, self.state_0)
+        newton.eval_fk(self.model, self.state_1.joint_q, self.state_1.joint_qd, self.state_1)
+
+        if len(self.drive_dofs) > 0:
+            self.desired_drive_vel = float(np.mean([joint_qd_np[dof] for dof in self.drive_dofs]))
+        else:
+            self.desired_drive_vel = float(omega0)
 
     def _resolve_actuated_dofs_from_names(self, builder: newton.ModelBuilder):
         joint_qd_start = list(builder.joint_qd_start)
@@ -618,8 +691,12 @@ class Example:
 
 if __name__ == "__main__":
     parser = newton.examples.create_parser()
+    parser.add_argument(
+        "--init-pos-speed",
+        action="store_true",
+        help="Initialize the chassis at a forward speed and wheel spin for no-slip rolling.",
+    )
     viewer, args = newton.examples.init(parser)
 
     example = Example(viewer, args)
     newton.examples.run(example, args)
-
