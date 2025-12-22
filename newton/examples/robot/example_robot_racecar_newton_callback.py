@@ -193,6 +193,22 @@ def _add_xfrc_applied_kernel(
     xfrc_applied[0, body] = wp.spatial_vector(f, t)
 
 
+@wp.kernel
+def _set_xfrc_applied_kernel(
+    body_ids: wp.array(dtype=wp.int32),
+    forces: wp.array(dtype=wp.vec3),
+    torques: wp.array(dtype=wp.vec3),
+    xfrc_applied: wp.array2d(dtype=wp.spatial_vector),
+):
+    """Overwrite Cartesian wrenches in mujoco_warp Data.xfrc_applied (world 0)."""
+    tid = wp.tid()
+    body = body_ids[tid]
+    if body < 0:
+        return
+
+    xfrc_applied[0, body] = wp.spatial_vector(forces[tid], torques[tid])
+
+
 class Example:
     def __init__(self, viewer, args=None):
         # simulation timing
@@ -596,11 +612,11 @@ class Example:
         wp.copy(self._tire_torques_wp, wp.array(torques, dtype=wp.vec3, device=self.model.device))
 
     def _tire_mjcb_control(self, m, d) -> None:
-        """MuJoCo-Warp control callback: add cached tire wrenches into `d.xfrc_applied`."""
+        """MuJoCo-Warp control callback: set cached tire wrenches into `d.xfrc_applied`."""
         if len(self.wheels) == 0:
             return
         wp.launch(
-            _add_xfrc_applied_kernel,
+            _set_xfrc_applied_kernel,
             dim=len(self.wheels),
             inputs=[self._wheel_mjc_body_ids_wp, self._tire_forces_wp, self._tire_torques_wp, d.xfrc_applied],
             device=self.model.device,
