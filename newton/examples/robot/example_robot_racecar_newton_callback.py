@@ -34,6 +34,7 @@ import math
 
 import numpy as np
 import warp as wp
+from collections import defaultdict
 
 import newton
 import newton.examples
@@ -311,7 +312,7 @@ class Example:
         if args is None or not getattr(args, "init_pos_speed", False):
             return
 
-        v0 = 2.0  # m/s, nominal tire model range and within max_drive_vel
+        v0 = 5.0  # m/s, nominal tire model range and within max_drive_vel
         omega0 = v0 / WHEEL_UNLOADED_RADIUS_M  # rad/s
 
         joint_qd_np = np.asarray(self.state_0.joint_qd.numpy(), dtype=np.float64)
@@ -494,10 +495,30 @@ class Example:
             wheel_mjc_body_ids.append(mjc_body_id)
 
         self._wheel_mjc_body_ids_wp = wp.array(wheel_mjc_body_ids, dtype=wp.int32, device=self.model.device)
+        self._wheel_mjc_body_ids_np = np.asarray(wheel_mjc_body_ids, dtype=np.int32)
 
         # Tire wrench buffers (world frame), applied in mjcb_control.
         self._tire_forces_wp = wp.zeros(len(wheels), dtype=wp.vec3, device=self.model.device)
         self._tire_torques_wp = wp.zeros(len(wheels), dtype=wp.vec3, device=self.model.device)
+
+        # Cached normal loads (from populate_contacts), held constant across RK stages.
+        self._wheel_fz_np = np.zeros(len(wheels), dtype=np.float64)
+        self._wheel_fz_wp = wp.zeros(len(wheels), dtype=wp.float32, device=self.model.device)
+
+        # Map MuJoCo geoms -> wheel index for contact filtering in mjcb_control.
+        mjc_geom_to_newton_shape = np.asarray(self.solver.mjc_geom_to_newton_shape.numpy(), dtype=np.int32)[0]
+        shape_to_geoms: dict[int, list[int]] = defaultdict(list)
+        for geom_id, shape_id in enumerate(mjc_geom_to_newton_shape.tolist()):
+            if shape_id >= 0:
+                shape_to_geoms[int(shape_id)].append(int(geom_id))
+
+        self._mjc_geom_to_wheel: dict[int, int] = {}
+        for wi, wheel in enumerate(self.wheels):
+            geoms: set[int] = set()
+            for sid in wheel.shape_ids.tolist():
+                geoms.update(shape_to_geoms.get(int(sid), []))
+            for gid in geoms:
+                self._mjc_geom_to_wheel[gid] = wi
 
         body_keys = list(self.model.body_key)
         self._chassis_body_id = 0
@@ -505,99 +526,140 @@ class Example:
             if preferred in body_keys:
                 self._chassis_body_id = body_keys.index(preferred)
                 break
+        self._chassis_mjc_body_id = int(newton_body_to_mjc.get(self._chassis_body_id, 0))
 
-    def _aggregate_wheel_contacts(self, wheel: WheelInfo) -> tuple[np.ndarray, np.ndarray, float, float] | None:
+    def _update_wheel_normal_loads_from_contacts(self) -> None:
+        """Cache per-wheel normal loads from the last MuJoCo solve (populate_contacts)."""
         if not hasattr(self.mj_contacts, "n_contacts"):
-            return None
+            self._wheel_fz_np.fill(0.0)
+            wp.copy(self._wheel_fz_wp, wp.array(self._wheel_fz_np, dtype=wp.float32, device=self.model.device))
+            return
+
         n = int(np.asarray(self.mj_contacts.n_contacts.numpy(), dtype=np.int32)[0])
         if n <= 0:
-            return None
+            self._wheel_fz_np.fill(0.0)
+            wp.copy(self._wheel_fz_wp, wp.array(self._wheel_fz_np, dtype=wp.float32, device=self.model.device))
+            return
 
         pairs = np.asarray(self.mj_contacts.pair.numpy(), dtype=np.int32)[:n]
-        pos = np.asarray(self.mj_contacts.position.numpy(), dtype=np.float64)[:n]
-        normal = np.asarray(self.mj_contacts.normal.numpy(), dtype=np.float64)[:n]
         f_n = np.asarray(self.mj_contacts.force.numpy(), dtype=np.float64)[:n]
-        sep = None
-        if hasattr(self.mj_contacts, "separation"):
-            sep = np.asarray(self.mj_contacts.separation.numpy(), dtype=np.float64)[:n]
 
-        wheel_shapes = set(int(s) for s in wheel.shape_ids.tolist())
-        fz = 0.0
-        p_sum = np.zeros(3, dtype=np.float64)
-        n_sum = np.zeros(3, dtype=np.float64)
-        depth_sum = 0.0
+        wheel_shape_sets = [set(int(s) for s in wheel.shape_ids.tolist()) for wheel in self.wheels]
+        fz = np.zeros(len(self.wheels), dtype=np.float64)
 
         for i in range(n):
-            s0, s1 = int(pairs[i, 0]), int(pairs[i, 1])
-            if s0 not in wheel_shapes and s1 not in wheel_shapes:
-                continue
             fi = float(f_n[i])
             if fi <= 0.0:
                 continue
-            fz += fi
-            p_sum += fi * pos[i]
-            n_sum += fi * normal[i]
-            if sep is not None:
-                depth_sum += fi * max(0.0, -float(sep[i]))
+            s0, s1 = int(pairs[i, 0]), int(pairs[i, 1])
+            for wi, wheel_shapes in enumerate(wheel_shape_sets):
+                if s0 in wheel_shapes or s1 in wheel_shapes:
+                    fz[wi] += fi
+                    break
 
-        if fz <= self.tire_params.fz_min:
-            return None
+        self._wheel_fz_np = fz
+        wp.copy(self._wheel_fz_wp, wp.array(fz, dtype=wp.float32, device=self.model.device))
 
-        p_c = p_sum / fz
-        n_c = _normalize(n_sum)
-        depth = (depth_sum / fz) if sep is not None else 0.0
-        return p_c, n_c, fz, depth
-
-    def _update_tire_forces_substep(self, state: newton.State) -> None:
-        """Compute tire tangential forces using *previous* contact normal load, cache for mjcb_control."""
-        if not hasattr(self.mj_contacts, "n_contacts"):
+    def _tire_mjcb_control(self, m, d) -> None:
+        """MuJoCo-Warp control callback: compute tire wrenches from current state, using cached normal loads."""
+        if len(self.wheels) == 0:
             return
 
-        body_q = np.asarray(state.body_q.numpy(), dtype=np.float64)
-        body_qd = np.asarray(state.body_qd.numpy(), dtype=np.float64)
-        joint_qd = np.asarray(state.joint_qd.numpy(), dtype=np.float64)
+        ncon = int(np.asarray(d.nacon.numpy(), dtype=np.int32)[0])
+        if ncon <= 0:
+            forces = np.zeros((len(self.wheels), 3), dtype=np.float32)
+            torques = np.zeros((len(self.wheels), 3), dtype=np.float32)
+            wp.copy(self._tire_forces_wp, wp.array(forces, dtype=wp.vec3, device=self.model.device))
+            wp.copy(self._tire_torques_wp, wp.array(torques, dtype=wp.vec3, device=self.model.device))
+            wp.launch(
+                _set_xfrc_applied_kernel,
+                dim=len(self.wheels),
+                inputs=[self._wheel_mjc_body_ids_wp, self._tire_forces_wp, self._tire_torques_wp, d.xfrc_applied],
+                device=self.model.device,
+            )
+            return
 
-        chassis_tf = _extract_xform7(body_q[self._chassis_body_id])
-        chassis_q = chassis_tf[3:7]
-        chassis_forward = _normalize(_quat_rotate_xyzw(chassis_q, np.array([1.0, 0.0, 0.0])))
-        chassis_up = _normalize(_quat_rotate_xyzw(chassis_q, np.array([0.0, 0.0, 1.0])))
+        worldid = 0
+        xipos = np.asarray(d.xipos.numpy(), dtype=np.float64)[worldid]  # (nbody,3), COM positions
+        xmat = np.asarray(d.xmat.numpy(), dtype=np.float64)[worldid]    # (nbody,3,3)
+        cvel = np.asarray(d.cvel.numpy(), dtype=np.float64)[worldid]    # (nbody,6) rot:lin
+
+        chassis_R = xmat[self._chassis_mjc_body_id]
+        chassis_forward = _normalize(chassis_R @ np.array([1.0, 0.0, 0.0], dtype=np.float64))
+        chassis_up = _normalize(chassis_R @ np.array([0.0, 0.0, 1.0], dtype=np.float64))
+
+        contact_world = np.asarray(d.contact.worldid.numpy(), dtype=np.int32)[:ncon]
+        contact_geom = np.asarray(d.contact.geom.numpy(), dtype=np.int32)[:ncon]
+        contact_pos = np.asarray(d.contact.pos.numpy(), dtype=np.float64)[:ncon]
+        contact_dist = np.asarray(d.contact.dist.numpy(), dtype=np.float64)[:ncon]
+        contact_frame = np.asarray(d.contact.frame.numpy(), dtype=np.float64)[:ncon]
+
+        wheel_pos: list[list[np.ndarray]] = [[] for _ in self.wheels]
+        wheel_nrm: list[list[np.ndarray]] = [[] for _ in self.wheels]
+        wheel_depth: list[list[float]] = [[] for _ in self.wheels]
+
+        for ci in range(ncon):
+            if int(contact_world[ci]) != worldid:
+                continue
+            g0 = int(contact_geom[ci, 0])
+            g1 = int(contact_geom[ci, 1])
+            wi = self._mjc_geom_to_wheel.get(g0)
+            if wi is None:
+                wi = self._mjc_geom_to_wheel.get(g1)
+            if wi is None:
+                continue
+
+            depth = max(0.0, -float(contact_dist[ci]))
+            if depth <= 0.0:
+                continue
+
+            p = np.asarray(contact_pos[ci], dtype=np.float64)
+            frame = np.asarray(contact_frame[ci], dtype=np.float64)
+
+            # Match populate_contacts() convention: normal is the first column of `contact.frame`.
+            n = _normalize(np.asarray(frame.T[0], dtype=np.float64))
+            if float(np.dot(n, chassis_up)) < 0.0:
+                n = -n
+
+            wheel_pos[wi].append(p)
+            wheel_nrm[wi].append(n)
+            wheel_depth[wi].append(depth)
 
         forces = np.zeros((len(self.wheels), 3), dtype=np.float32)
         torques = np.zeros((len(self.wheels), 3), dtype=np.float32)
 
         for wi, wheel in enumerate(self.wheels):
-            agg = self._aggregate_wheel_contacts(wheel)
-            if agg is None:
+            if len(wheel_pos[wi]) == 0:
                 continue
-            p_c, n_c, fz, depth = agg
 
-            wheel_tf = _extract_xform7(body_q[wheel.body_id])
-            wheel_p = wheel_tf[:3]
-            wheel_q = wheel_tf[3:7]
+            p_c = np.mean(np.stack(wheel_pos[wi], axis=0), axis=0)
+            n_c = _normalize(np.mean(np.stack(wheel_nrm[wi], axis=0), axis=0))
+            depth = float(np.mean(np.asarray(wheel_depth[wi], dtype=np.float64)))
 
-            com_offset_w = _quat_rotate_xyzw(wheel_q, self._body_com_np[wheel.body_id])
-            com_w = wheel_p + com_offset_w
+            fz = float(self._wheel_fz_np[wi])
+            if fz <= self.tire_params.fz_min:
+                continue
 
-            v_com = _extract_spatial6(body_qd[wheel.body_id])[:3]
-            w_w = _extract_spatial6(body_qd[wheel.body_id])[3:]
-            v_origin = v_com + np.cross(w_w, wheel_p - com_w)
+            wheel_body = int(self._wheel_mjc_body_ids_np[wi])
+            com_w = xipos[wheel_body]
+            w_w = np.asarray(cvel[wheel_body, 0:3], dtype=np.float64)
+            v_com_w = np.asarray(cvel[wheel_body, 3:6], dtype=np.float64)
 
-            axis_world = _normalize(_quat_rotate_xyzw(wheel_q, wheel.axis_child))
+            axis_world = _normalize(xmat[wheel_body] @ wheel.axis_child)
             z = n_c
-            if np.dot(z, chassis_up) < 0.0:
+            if float(np.dot(z, chassis_up)) < 0.0:
                 z = -z
             x = _normalize(np.cross(axis_world, z))
-            if np.linalg.norm(x) < 1e-8:
-                x = _normalize(chassis_forward - np.dot(chassis_forward, z) * z)
-            if np.dot(x, chassis_forward) < 0.0:
+            if float(np.linalg.norm(x)) < 1e-8:
+                x = _normalize(chassis_forward - float(np.dot(chassis_forward, z)) * z)
+            if float(np.dot(x, chassis_forward)) < 0.0:
                 axis_world = -axis_world
                 x = -x
             y = _normalize(np.cross(z, x))
 
-            omega = float(joint_qd[wheel.dof_id]) * float(np.dot(y, axis_world))
-
-            v_x = float(np.dot(v_origin, x))
-            v_y = float(np.dot(v_origin, y))
+            omega = float(np.dot(w_w, axis_world))
+            v_x = float(np.dot(v_com_w, x))
+            v_y = float(np.dot(v_com_w, y))
 
             r_eff = max(0.2 * wheel.radius, wheel.radius - depth)
             f_x, f_y, m_y, m_z = _fiala_forces(self.tire_params, fz=fz, v_x=v_x, v_y=v_y, omega=omega, r_eff=r_eff)
@@ -610,11 +672,6 @@ class Example:
 
         wp.copy(self._tire_forces_wp, wp.array(forces, dtype=wp.vec3, device=self.model.device))
         wp.copy(self._tire_torques_wp, wp.array(torques, dtype=wp.vec3, device=self.model.device))
-
-    def _tire_mjcb_control(self, m, d) -> None:
-        """MuJoCo-Warp control callback: set cached tire wrenches into `d.xfrc_applied`."""
-        if len(self.wheels) == 0:
-            return
         wp.launch(
             _set_xfrc_applied_kernel,
             dim=len(self.wheels),
@@ -685,9 +742,9 @@ class Example:
             # mapped into MuJoCo before the callback runs.
             self.viewer.apply_forces(self.state_0)
 
-            # Compute tire forces using previous-step normal loads and cache them
-            # for application in `mjcb_control`.
-            self._update_tire_forces_substep(self.state_0)
+            # Cache the current normal loads (from the previous-step solve) for use
+            # across all RK stages in the upcoming step.
+            self._update_wheel_normal_loads_from_contacts()
 
             self.solver.step(self.state_0, self.state_1, self.control, None, self.sim_dt)
 
