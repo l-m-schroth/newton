@@ -1,0 +1,309 @@
+% Substep 1 documentation (Conventions)
+%
+% This file captures the frame/sign/unit conventions that must be understood
+% and kept consistent when porting Chrono's tire + collision functionality to
+% Newton + MuJoCo-Warp.
+%
+% Key philosophy:
+%   - Chrono is the reference for the tire model math and disc-terrain collision.
+%   - Newton/MuJoCo-Warp should reproduce Chrono behavior (within sensible tolerances).
+%   - We should not "guess" conventions at runtime; determine once, document, then implement.
+%
+\section{Substep 1: Conventions (Frames, Signs, Units)}
+\label{sec:substep1-conventions}
+
+\subsection{Scope}
+This document records conventions that affect correctness when porting:
+\begin{itemize}
+  \item coordinate frames (world, body, tire/contact),
+  \item axis directions and sign conventions,
+  \item quaternion layouts and velocity frame conventions,
+  \item definitions of tire slip quantities,
+  \item force/torque ordering and application points.
+\end{itemize}
+
+\subsection{Chrono (Ground Truth) Conventions}
+
+\subsubsection{World frame: ISO}
+\begin{itemize}
+  \item \textbf{Default vehicle world frame is ISO:} $Z$ up, $X$ forward, $Y$ left.
+  \item Reference: \texttt{chrono/src/chrono\_vehicle/ChWorldFrame.h} (\texttt{ChWorldFrame} docstring and defaults).
+\end{itemize}
+
+\subsubsection{Units}
+\begin{itemize}
+  \item Chrono::Vehicle uses SI: meters, seconds, kilograms, Newtons, Newton-meters, radians.
+  \item Tire JSON inputs (e.g.\ \texttt{FialaTire.json}, \texttt{HMMWV\_FialaTire.json}) are in these SI units.
+\end{itemize}
+
+\subsubsection{Wheel axis and \texttt{WheelState.omega}}
+Chrono defines the wheel ``normal'' (disc normal / rotation axis) as the wheel's \emph{local $Y$ axis} in the global frame:
+\begin{itemize}
+  \item Reference: \texttt{chrono/src/chrono\_vehicle/wheeled\_vehicle/ChTire.cpp} \texttt{ChTire::CalculateKinematics}:
+        \texttt{wheel\_normal = wheel\_state.rot.GetAxisY()}.
+  \item Reference: \texttt{chrono/src/chrono\_vehicle/wheeled\_vehicle/ChWheel.cpp} \texttt{ChWheel::GetState}:
+        \texttt{omega = ang\_vel\_loc.y()} (wheel angular speed about local $Y$).
+\end{itemize}
+\noindent
+Implication: for a typical wheeled vehicle modeled in ISO ($X$ forward, $Y$ left, $Z$ up),
+``forward rolling'' corresponds to \texttt{omega} having the sign consistent with right-hand rotation about the wheel local $Y$ axis.
+
+\subsubsection{Disc-terrain collision contact frame (\texttt{ChTire::DiscTerrainCollision*})}
+Chrono's disc-terrain collision routines return a contact coordinate system with:
+\begin{itemize}
+  \item $Z$ axis = terrain normal at the contact point,
+  \item $X$ axis = rolling / longitudinal direction,
+  \item $Y$ axis = lateral direction completing the right-handed frame.
+\end{itemize}
+\noindent
+References:
+\begin{itemize}
+  \item API comments: \texttt{chrono/src/chrono\_vehicle/wheeled\_vehicle/ChTire.h} (\texttt{DiscTerrainCollision1pt/4pt} docs).
+  \item Implementation: \texttt{chrono/src/chrono\_vehicle/wheeled\_vehicle/ChTire.cpp}:
+        \texttt{longitudinal = Vcross(disc\_normal, normal);} \texttt{lateral = Vcross(normal, longitudinal);} then
+        \texttt{rot.SetFromDirectionAxes(longitudinal, lateral, normal);}.
+\end{itemize}
+
+\paragraph{Sanity check (flat ground)}
+For ISO world, assume:
+\begin{itemize}
+  \item terrain normal $\mathbf{n} = +\hat{z}$,
+  \item wheel disc normal $\mathbf{d} = +\hat{y}$.
+\end{itemize}
+Then Chrono's longitudinal axis is $\hat{x} = \mathbf{d} \times \mathbf{n} = \hat{y} \times \hat{z} = \hat{x}$,
+so the contact frame $X$ points forward as expected.
+
+\subsubsection{Slip definitions in \texttt{ChTire::CalculateKinematics}}
+Chrono computes slip quantities from the wheel linear velocity expressed in the contact/tire frame:
+\begin{itemize}
+  \item Reference: \texttt{chrono/src/chrono\_vehicle/wheeled\_vehicle/ChTire.cpp} \texttt{ChTire::CalculateKinematics}.
+\end{itemize}
+\noindent
+Let $\mathbf{V}$ be the wheel linear velocity expressed in the tire frame:
+\begin{verbatim}
+V = tire_frame.TransformDirectionParentToLocal(wheel_state.lin_vel)
+abs_Vx = abs(V.x)
+slip_angle = atan(V.y / abs_Vx)          (if abs_Vx > 1e-4 else 0)
+long_slip  = -(V.x - omega*R) / abs_Vx   (if abs_Vx > 1e-4 else 0)
+\end{verbatim}
+\begin{itemize}
+  \item \textbf{Slip angle sign:} positive = left turn (positive lateral velocity in tire frame).
+  \item \textbf{Longitudinal slip sign:} positive = driving, negative = braking.
+\end{itemize}
+
+\subsubsection{Slip definitions used by \texttt{ChFialaTire} (patch forces)}
+Chrono's \texttt{ChFialaTire} uses a closely related definition, but with an \emph{effective rolling radius}
+$R_{\mathrm{eff}} = R - \texttt{depth}$ for the slip computation:
+\begin{itemize}
+  \item Reference: \texttt{chrono/src/chrono\_vehicle/wheeled\_vehicle/tire/ChFialaTire.cpp} \texttt{Synchronize} and \texttt{Advance}.
+\end{itemize}
+\begin{verbatim}
+vsx = vel.x - omega * (unloaded_radius - depth)
+vsy = vel.y
+kappa = -vsx / abs_vx              (if abs_vx != 0 else 0)
+alpha = atan2(vsy, abs_vx)         (if abs_vx != 0 else 0)
+\end{verbatim}
+Here \texttt{vel} is the wheel linear velocity expressed in the contact frame
+\texttt{m_data.frame.TransformDirectionParentToLocal(wheel_state.lin_vel)}.
+
+\subsubsection{Fiala patch force directions (\texttt{ChFialaTire::FialaPatchForces})}
+Chrono computes longitudinal force $F_x$, lateral force $F_y$, and aligning moment $M_z$ in the \emph{contact frame}.
+Key sign consequences:
+\begin{itemize}
+  \item Reference: \texttt{chrono/src/chrono\_vehicle/wheeled\_vehicle/tire/ChFialaTire.cpp} \texttt{FialaPatchForces}.
+  \item For $\alpha>0$ (left slip angle), Chrono returns $F_y<0$ (force to the right), i.e.\ it resists lateral slip.
+  \item For $\kappa>0$ (driving), Chrono returns $F_x>0$ (force forward), i.e.\ traction in the $+X$ direction of the contact frame.
+\end{itemize}
+
+\subsubsection{Rolling resistance moment direction (\texttt{ChFialaTire::Advance})}
+Chrono defines a rolling resistance moment about the wheel rotation axis (contact-frame $Y$):
+\begin{itemize}
+  \item Reference: \texttt{chrono/src/chrono\_vehicle/wheeled\_vehicle/tire/ChFialaTire.cpp} \texttt{Advance}.
+  \item \texttt{My = -startup(abs\_vx) * rolling\_resistance * Fz * sign(omega)}.
+  \item Interpretation: for $\omega>0$ (forward rolling per Chrono's wheel axis convention), $M_y<0$ opposes $\omega$.
+\end{itemize}
+
+\subsubsection{From contact-frame forces to a wrench at the wheel center}
+Force-element tires in Chrono compute forces/moments in the contact frame and then return a world-frame wrench applied at
+the wheel center:
+\begin{itemize}
+  \item Reference: \texttt{chrono/src/chrono\_vehicle/wheeled\_vehicle/tire/ChForceElementTire.cpp}
+        \texttt{ChForceElementTire::GetTireForce}.
+  \item Steps:
+    \begin{enumerate}
+      \item rotate $(\mathbf{F}, \boldsymbol{\tau})$ from contact frame to world using \texttt{m\_data.frame},
+      \item shift moment from contact patch to wheel center by adding $\mathbf{r} \times \mathbf{F}$,
+            where \texttt{r = (frame.pos + depth * frame.zaxis) - wheel\_center}.
+    \end{enumerate}
+\end{itemize}
+\noindent
+This matters for MuJoCo/Newton integration because MuJoCo expects applied wrenches at body COM.
+
+\subsection{MuJoCo Conventions (Engine)}
+
+\subsubsection{Coordinate frames}
+\begin{itemize}
+  \item MuJoCo uses \textbf{right-handed} frames with \textbf{$Z$ as the vertical axis} (i.e.\ $Z$ up by convention).
+  \item Reference: \texttt{mujoco/doc/unity.rst} (Unity vs MuJoCo note).
+\end{itemize}
+MuJoCo does not impose a semantic meaning for ``forward'' in $X/Y$; it is model-dependent. For the vehicle port we will
+choose the Chrono ISO semantics ($X$ forward, $Y$ left, $Z$ up) in the MJCF to minimize mental conversions.
+
+\subsubsection{Data layout, quaternions, and 6D spatial vectors}
+\begin{itemize}
+  \item Matrices are \textbf{row-major}.
+  \item Quaternions are stored as \textbf{$(w, x, y, z)$} (scalar first); null rotation is $(1,0,0,0)$.
+  \item MuJoCo internal 6D spatial vectors use \textbf{(rotation, translation)} order (rotational 3-vector first).
+  \item Reference: \texttt{mujoco/doc/programming/simulation.rst} (``Data layout'' section \texttt{siLayout}).
+\end{itemize}
+
+\subsubsection{Free joint velocity frame convention}
+\begin{itemize}
+  \item Free joint position is $(x,y,z)$ in world and quaternion $(w,x,y,z)$ in world.
+  \item Free joint velocity is 6D: \textbf{linear velocity in world}, followed by \textbf{angular velocity in the local body frame}.
+  \item Reference: \texttt{mujoco/doc/overview.rst} (``Floating objects'' section).
+\end{itemize}
+\noindent
+This is a key mismatch with Newton's preferred convention (world-frame angular velocity), so conversion is required.
+
+\subsubsection{Contact frame conventions}
+\begin{itemize}
+  \item MuJoCo defines the contact frame such that the \textbf{contact normal is the $X$ axis} of the contact frame.
+  \item \texttt{mjContact.frame} is stored \textbf{transposed} relative to typical frame matrices: axes are along rows.
+        In row-major storage, \texttt{frame[0:3]} is the normal axis, \texttt{frame[3:6]} is tangent1, \texttt{frame[6:9]} is tangent2.
+  \item Reference: \texttt{mujoco/doc/programming/simulation.rst} (``Contacts'' section around \texttt{mjContact.frame}).
+\end{itemize}
+\noindent
+This differs from Chrono tire frames (Chrono uses $Z$ as normal), so we should not directly reuse MuJoCo contact frames
+as Chrono tire frames without an explicit mapping.
+
+\subsubsection{\texttt{xfrc\_applied} convention}
+\begin{itemize}
+  \item \texttt{mjData.xfrc\_applied} stores \textbf{Cartesian wrenches applied at each body's center of mass}.
+  \item The ordering is \textbf{force then torque}: $(F_x,F_y,F_z,\;\tau_x,\tau_y,\tau_z)$.
+  \item The wrench is expressed in the \textbf{world frame}.
+  \item References:
+    \begin{itemize}
+      \item Doc: \texttt{mujoco/doc/computation/index.rst} (``Auxiliary Controls: qfrc\_applied and xfrc\_applied'').
+      \item Code: \texttt{mujoco/src/engine/engine\_support.c} \texttt{mj\_xfrcAccumulate} calls
+            \texttt{mj\_applyFT(force=xfrc[0:3], torque=xfrc[3:6], point=xipos)}.
+    \end{itemize}
+\end{itemize}
+
+\subsection{MuJoCo-Warp (MJWarp) Conventions}
+
+\subsubsection{Quaternions in MJWarp}
+MJWarp uses Warp's \texttt{wp.quat} container but follows MuJoCo's quaternion convention:
+\begin{itemize}
+  \item Quaternions are treated as \textbf{$(w,x,y,z)$}.
+  \item MJWarp implements its own quaternion math routines to avoid Warp's default $xyzw$ assumption.
+  \item References:
+    \begin{itemize}
+      \item \texttt{mujoco/doc/mjwarp/index.rst} (quaternion FAQ: $w,x,y,z$).
+      \item \texttt{mujoco\_warp/mujoco\_warp/\_src/math.py} (\texttt{mul\_quat}, \texttt{rot\_vec\_quat}, etc.\ use \texttt{quat[0]} as scalar).
+    \end{itemize}
+\end{itemize}
+
+\subsubsection{Contact frames in MJWarp}
+MJWarp stores the contact frame in a \texttt{wp.mat33} with the \textbf{same transposed layout as MuJoCo}:
+\begin{itemize}
+  \item Row 0 is the contact normal direction in world coordinates.
+  \item Reference: \texttt{mujoco\_warp/mujoco\_warp/\_src/sensor.py} (contact normal accessed as \texttt{contact\_frame[cid][0]}).
+\end{itemize}
+
+\subsubsection{Mixed 6D conventions: spatial vectors vs API ``force:torque''}
+MJWarp uses \texttt{wp.spatial\_vector} as a 6-float container for many arrays, but the \emph{meaning} of the 6 entries
+depends on the field:
+\begin{itemize}
+  \item Internal spatial algebra quantities (e.g.\ \texttt{cdof}, \texttt{cvel}, \texttt{cfrc\_ext}) follow MuJoCo's
+        \textbf{(rotation, translation)} ordering.
+        Reference: MuJoCo ``Data layout'' doc; see also MJWarp kernels using \texttt{wp.spatial\_top/bottom} accordingly.
+  \item API-aligned fields like \texttt{xfrc\_applied} and outputs of \texttt{mj\_contactForce} are treated as
+        \textbf{(force, torque)} (force first), matching MuJoCo's public API.
+        References:
+        \begin{itemize}
+          \item \texttt{mujoco\_warp/mujoco\_warp/\_src/types.py} documents \texttt{xfrc\_applied: applied Cartesian force/torque}.
+          \item \texttt{mujoco\_warp/mujoco\_warp/\_src/support.py} \texttt{\_apply\_ft} explicitly reorders \texttt{cdof} to dot with
+                \texttt{xfrc} interpreted as (force, torque).
+          \item \texttt{mujoco\_warp/mujoco\_warp/\_src/sensor.py} writes contact ``force'' from indices [0:3] and ``torque'' from [3:6].
+        \end{itemize}
+\end{itemize}
+\noindent
+Implication: when porting algorithms, \emph{do not assume} that ``spatial\_vector == (torque, force)'' everywhere in MJWarp.
+Always check the specific field semantics.
+
+\subsection{Newton Conventions (and Newton $\leftrightarrow$ MuJoCo Mappings)}
+
+\subsubsection{Newton world and units}
+\begin{itemize}
+  \item Newton is SI by design (meters, seconds, Newtons, radians, kg).
+  \item Default simulation up axis is \textbf{$Z$}: \texttt{newton/newton/\_src/sim/builder.py} (\texttt{ModelBuilder(up\_axis=Axis.Z)}).
+\end{itemize}
+
+\subsubsection{Newton state conventions for rigid bodies}
+\begin{itemize}
+  \item \texttt{State.body\_q} is a \texttt{wp.transform} pose for the \textbf{body frame} (not necessarily at COM).
+  \item \texttt{Model.body\_com} is the COM offset in the body frame; COM world position is \texttt{transform\_point(body\_q, body\_com)}.
+  \item \texttt{State.body\_f} is an external wrench \textbf{at the body COM, in world frame}, ordered as:
+        $(f_x,f_y,f_z,\;t_x,t_y,t_z)$.
+  \item Reference: \texttt{newton/newton/\_src/sim/state.py}.
+\end{itemize}
+
+\subsubsection{Newton uses Warp quaternion $xyzw$ internally}
+Newton uses Warp's native quaternion layout $xyzw$ for its internal state arrays (and Warp built-ins):
+\begin{itemize}
+  \item In the MuJoCo solver, conversions explicitly swap MuJoCo $wxyz$ to Warp $xyzw$ and back:
+        \texttt{newton/newton/\_src/solvers/mujoco/kernels.py}:
+        \texttt{convert\_mj\_coords\_to\_warp\_kernel} and \texttt{convert\_warp\_coords\_to\_mj\_kernel}.
+  \item Example (FREE joint): MuJoCo stores \texttt{qpos = [pos, w, x, y, z]}; Newton stores \texttt{joint\_q = [pos, x, y, z, w]}.
+\end{itemize}
+
+\subsubsection{Free joint angular velocity conversion (MuJoCo local $\rightarrow$ Newton world)}
+Because MuJoCo free-joint angular velocity is local-body-frame while Newton wants world-frame angular velocity, the MuJoCo solver does:
+\begin{itemize}
+  \item \texttt{w\_world = quat\_rotate(rot\_world\_from\_body, w\_local)} when reading MuJoCo into Newton.
+  \item \texttt{w\_local = quat\_rotate\_inv(rot\_world\_from\_body, w\_world)} when writing Newton back to MuJoCo.
+  \item Reference: \texttt{newton/newton/\_src/solvers/mujoco/kernels.py} (\texttt{convert\_mj\_coords\_to\_warp\_kernel} and inverse).
+\end{itemize}
+
+\subsubsection{Newton body forces $\rightarrow$ MuJoCo \texttt{xfrc\_applied}}
+Newton's MuJoCo solver maps \texttt{State.body\_f} directly into \texttt{xfrc\_applied} with the same ordering:
+\begin{itemize}
+  \item Both use $(F,\tau)$ in world frame.
+  \item Reference: \texttt{newton/newton/\_src/solvers/mujoco/kernels.py} \texttt{apply\_mjc\_body\_f\_kernel}.
+\end{itemize}
+
+\subsection{Implications for the Chrono Tire Port}
+
+\subsubsection{Canonical conventions for the port}
+To reduce risk, the tire implementation in Newton should adopt Chrono's conventions \emph{as the source of truth}:
+\begin{itemize}
+  \item World: ISO semantics ($X$ forward, $Y$ left, $Z$ up), consistent with default Newton up axis and typical MJCF.
+  \item Tire/contact frame: Chrono tire frame with $X$ longitudinal (rolling), $Y$ lateral (left), $Z$ terrain normal.
+  \item Slip: replicate Chrono definitions for $\kappa$, $\alpha$ including low-speed branching and $R_{\mathrm{eff}}$ usage.
+\end{itemize}
+
+\subsubsection{Applying Chrono-style tire forces in MuJoCo/Newton}
+MuJoCo expects an applied wrench at the body COM in world coordinates via \texttt{xfrc\_applied}.
+Chrono provides (conceptually) a contact-frame force/moment plus a rule for shifting to the wheel center.
+Therefore, the integration should:
+\begin{enumerate}
+  \item Build the Chrono-style contact frame (as in \texttt{ChTire::DiscTerrainCollision*}).
+  \item Compute tire forces/moments in that frame (Fiala model).
+  \item Rotate to world:
+    \[
+      \mathbf{F}_W = R_{W\leftarrow C}\,\mathbf{F}_C,\qquad
+      \boldsymbol{\tau}_W = R_{W\leftarrow C}\,\boldsymbol{\tau}_C.
+    \]
+  \item Shift to COM (MuJoCo convention):
+    \[
+      \boldsymbol{\tau}_{W,\mathrm{COM}} = \boldsymbol{\tau}_W + (\mathbf{p}_{\mathrm{app}} - \mathbf{p}_{\mathrm{COM}}) \times \mathbf{F}_W,
+    \]
+    where $\mathbf{p}_{\mathrm{app}}$ should match Chrono's effective application point logic
+    (see \texttt{ChForceElementTire::GetTireForce}).
+  \item Write $(\mathbf{F}_W,\boldsymbol{\tau}_{W,\mathrm{COM}})$ into Newton \texttt{State.body\_f} for the wheel body,
+        letting the MuJoCo solver map it into \texttt{xfrc\_applied}.
+\end{enumerate}
+\noindent
+This keeps the high-level structure Chrono-like and avoids mixing MuJoCo contact-frame conventions with Chrono tire-frame conventions.
+

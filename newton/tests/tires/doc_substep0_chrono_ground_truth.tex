@@ -1,0 +1,237 @@
+% Substep 0 documentation (Chrono ground-truth tests infrastructure)
+%
+% This file documents the implementation work done in substep 0 of the tire-model
+% porting plan: creating a Chrono-based ground-truth oracle callable from Python
+% unit tests.
+%
+% Repository layout note:
+%   - Newton repo is in ./newton
+%   - Chrono repo/build is in ./chrono
+%
+\section{Substep 0: Chrono Ground-Truth Test Infrastructure}
+\label{sec:substep0-chrono-gt}
+
+\subsection{Goal}
+The purpose of substep~0 is to create a \emph{ground-truth oracle} for later unit tests.
+Chrono (C++) is treated as reference and must \emph{not} be modified to make tests pass.
+The Newton implementation will be validated by comparing its outputs against Chrono outputs.
+
+Because \texttt{pychrono} is not assumed to be available, the oracle is implemented as a small
+standalone C++ executable that links against the locally built Chrono libraries and communicates
+via a JSON-in/JSON-out protocol.
+
+\subsection{What Was Added (Files)}
+The following files were added under \texttt{newton/newton/tests/tires}:
+
+\begin{itemize}
+  \item \texttt{newton/newton/tests/tires/chrono\_gt.py}:
+    Python helper that runs the Chrono oracle via \texttt{subprocess} and parses JSON output.
+
+  \item \texttt{newton/newton/tests/tires/chrono\_gt/}:
+    Source and build files for the Chrono oracle executable.
+
+    \begin{itemize}
+      \item \texttt{newton/newton/tests/tires/chrono\_gt/newton\_chrono\_gt.cpp}:
+        C++ CLI implementation (JSON protocol + Chrono calls).
+
+      \item \texttt{newton/newton/tests/tires/chrono\_gt/CMakeLists.txt}:
+        Minimal CMake project that links the executable against Chrono.
+
+      \item \texttt{newton/newton/tests/tires/chrono\_gt/README.md}:
+        Build instructions and binary location conventions.
+    \end{itemize}
+
+  \item \texttt{newton/newton/tests/tires/\_\_init\_\_.py}:
+    Makes \texttt{newton.tests.tires} a package namespace for upcoming unit tests.
+\end{itemize}
+
+\subsection{Design Overview}
+\subsubsection{Why a C++ CLI Oracle?}
+\begin{itemize}
+  \item \textbf{No dependency on PyChrono:} in this environment \texttt{pychrono} is not installed.
+  \item \textbf{Exact Chrono codepaths:} the executable links directly against the Chrono build in the workspace.
+  \item \textbf{Auditability:} the ground-truth behavior is explicit and version-controlled, and the Chrono
+        version used is the local build.
+  \item \textbf{Test policy alignment:} Python unit tests can hard-fail if the binary is missing.
+\end{itemize}
+
+\subsubsection{Protocol Choice: JSON-in / JSON-out}
+The oracle reads a single JSON object from \texttt{stdin} and prints a single JSON object to \texttt{stdout}.
+This format is:
+\begin{itemize}
+  \item easy to extend with additional commands and outputs,
+  \item stable across languages,
+  \item convenient for Python test harnesses.
+\end{itemize}
+
+\subsection{Python Helper: \texttt{run\_chrono\_gt}}
+\label{sec:substep0-python-helper}
+File: \texttt{newton/newton/tests/tires/chrono\_gt.py}
+
+\paragraph{Main responsibilities}
+\begin{itemize}
+  \item Locate the oracle binary.
+  \item Run it via \texttt{subprocess.run} with JSON request on \texttt{stdin}.
+  \item Ensure Chrono shared libraries can be resolved at runtime.
+  \item Parse \texttt{stdout} as JSON and raise clear exceptions on failure.
+\end{itemize}
+
+\paragraph{Binary resolution}
+The helper resolves the executable path using:
+\begin{enumerate}
+  \item Environment variable \texttt{NEWTON\_CHRONO\_GT\_BIN} (explicit override).
+  \item Default path: \texttt{newton/newton/tests/tires/chrono\_gt/build/newton\_chrono\_gt}.
+\end{enumerate}
+
+\paragraph{Shared library resolution (Linux)}
+Since Chrono is built as shared libraries in this workspace, the helper prepends
+\texttt{chrono/build/lib} to \texttt{LD\_LIBRARY\_PATH} for the subprocess.
+
+\paragraph{Why this helper does \emph{not} import Newton}
+This helper is intentionally standalone and only depends on the Python standard library.
+Importing \texttt{newton} would pull in \texttt{warp}, which may not be importable in minimal
+unit-test contexts. Keeping the helper independent makes it usable even in test environments
+that only need the Chrono oracle.
+
+\paragraph{Example use in a future unittest}
+\begin{verbatim}
+from newton.tests.tires.chrono_gt import run_chrono_gt
+
+resp = run_chrono_gt({
+  "cmd": "fiala_patch_forces",
+  "tire_json": "chrono/build/data/vehicle/generic/tire/FialaTire.json",
+  "kappa": 0.1,
+  "alpha": 0.05,
+  "fz": 3000.0,
+  "mu": 0.8,
+})
+assert resp["ok"]
+print(resp["fx"], resp["fy"], resp["mz"])
+\end{verbatim}
+
+\subsection{Chrono Oracle Executable: \texttt{newton\_chrono\_gt}}
+\label{sec:substep0-cli}
+File: \texttt{newton/newton/tests/tires/chrono\_gt/newton\_chrono\_gt.cpp}
+
+\subsubsection{Build System}
+File: \texttt{newton/newton/tests/tires/chrono\_gt/CMakeLists.txt}
+
+\begin{itemize}
+  \item Uses \texttt{find\_package(Chrono REQUIRED COMPONENTS Vehicle)} with \texttt{Chrono\_DIR}
+        pointing at \texttt{chrono/build/cmake}.
+  \item Links the binary against \texttt{Chrono::Chrono\_vehicle} and \texttt{Chrono::Chrono\_core}.
+  \item Sets an \texttt{RPATH} to \texttt{\$\{CHRONO\_PACKAGE\_PREFIX\_DIR\}/lib} when available,
+        to reduce reliance on \texttt{LD\_LIBRARY\_PATH}.
+\end{itemize}
+
+\paragraph{Build commands (from repo root)}
+\begin{verbatim}
+cmake -S newton/newton/tests/tires/chrono_gt \
+      -B newton/newton/tests/tires/chrono_gt/build \
+      -DChrono_DIR="$(pwd)/chrono/build/cmake"
+cmake --build newton/newton/tests/tires/chrono_gt/build -j
+\end{verbatim}
+
+\subsubsection{Why Wrapper Types Were Introduced}
+The oracle needs to call specific Chrono implementations. However, some of the most
+relevant pieces for a clean ground-truth interface are \emph{not public APIs} in Chrono.
+Therefore, small wrapper classes are used to access protected members without modifying Chrono.
+
+\paragraph{\texttt{ExposedFialaTire}}
+\begin{itemize}
+  \item Purpose: expose protected \texttt{ChFialaTire} internals required for unit-testable ground-truth queries.
+  \item Example: \texttt{ChFialaTire::FialaPatchForces} is protected, so the wrapper provides a
+        public forwarding method \texttt{PatchForces(...)}.
+  \item It also allows setting \texttt{m\_mu} (road friction) explicitly for deterministic comparisons.
+\end{itemize}
+
+\paragraph{Avoiding stdout pollution}
+The file-based Chrono constructor \texttt{FialaTire(const std::string\&)} prints
+\texttt{"Loaded JSON ..."} to stdout, which would break the JSON protocol. The wrapper
+therefore reads the JSON using Chrono's own \texttt{ReadFileJSON} and constructs
+\texttt{FialaTire(const rapidjson::Document\&)} instead, which is non-verbose.
+
+\paragraph{\texttt{TireAccess}}
+\begin{itemize}
+  \item Purpose: provide public access to Chrono's protected static collision helpers
+        \texttt{ChTire::DiscTerrainCollision} and \texttt{ChTire::ConstructAreaDepthTable}.
+  \item This preserves the exact Chrono implementation while avoiding changes to Chrono source code.
+\end{itemize}
+
+\paragraph{\texttt{AnalyticTerrain}}
+\begin{itemize}
+  \item Purpose: supply a minimal, deterministic \texttt{ChTerrain} implementation.
+  \item Chrono collision routines query terrain via \texttt{GetHeight/GetNormal/GetProperties}.
+        Chrono's base \texttt{ChTerrain} is a stub (flat ground), which is insufficient for testing
+        non-trivial terrain in later steps.
+  \item By providing analytic height and analytic normals, unit tests can validate collision behavior
+        without pulling in Chrono's heavier terrain subsystems.
+\end{itemize}
+
+\subsubsection{Implemented Commands}
+Each request must include a \texttt{"cmd"} string.
+The executable returns a response object that always includes \texttt{"cmd"} and either
+\texttt{"ok": true} or \texttt{"ok": false, "error": ...}.
+
+\paragraph{Tire parameter + vertical force queries}
+\begin{itemize}
+  \item \texttt{get\_params}: returns \texttt{unloaded\_radius}, \texttt{width}, \texttt{rolling\_resistance}, \texttt{mu0}.
+  \item \texttt{normal\_stiffness\_force}: calls \texttt{FialaTire::GetNormalStiffnessForce(depth)}.
+  \item \texttt{normal\_damping\_force}: calls \texttt{FialaTire::GetNormalDampingForce(depth, velocity)}.
+  \item \texttt{normal\_load}: computes \texttt{Fz = fstiff(depth) + fdamp(depth, -vel\_z)} then clamps to \texttt{Fz\ge 0}
+        (mirrors Chrono's \texttt{ChFialaTire::Synchronize} definition).
+\end{itemize}
+
+\paragraph{Fiala patch forces}
+\begin{itemize}
+  \item \texttt{fiala\_patch\_forces}: calls Chrono's protected \texttt{FialaPatchForces} implementation via
+        \texttt{ExposedFialaTire::PatchForces}.
+  \item The request provides \texttt{kappa}, \texttt{alpha}, \texttt{fz}, and \texttt{mu}.
+  \item Optional \texttt{clamp\_mu} applies the same clamping used by Chrono tire models
+        (\texttt{mu \in [0.1, 1.0]}) before setting \texttt{m\_mu}.
+\end{itemize}
+
+\paragraph{Rolling resistance smoothing}
+\begin{itemize}
+  \item \texttt{rolling\_resistance\_moment}: returns the rolling moment \texttt{My} computed using
+        Chrono's \texttt{ChFunctionSineStep::Eval} and \texttt{ChSignum}.
+  \item There is no standalone Chrono public function for this quantity; in Chrono it is computed
+        inside \texttt{ChFialaTire::Advance}. The oracle therefore implements the formula directly,
+        but uses Chrono helper functions for the sine-step and sign.
+\end{itemize}
+
+\paragraph{Slip definitions}
+\begin{itemize}
+  \item \texttt{fiala\_slip}: returns slip quantities derived with Chrono's internal sign conventions:
+        \texttt{vsx = v\_x - omega*r\_eff}, \texttt{kappa = -vsx/|v\_x|}, \texttt{alpha = atan2(v\_y, |v\_x|)}.
+  \item This is provided because the slip definitions are embedded in Chrono's tire update pipeline
+        rather than exposed as a standalone API.
+\end{itemize}
+
+\paragraph{Disc-terrain collision (Chrono collision pipeline)}
+\begin{itemize}
+  \item \texttt{disc\_terrain\_collision}: calls Chrono's \texttt{ChTire::DiscTerrainCollision} implementation
+        (via \texttt{TireAccess}).
+  \item Uses \texttt{AnalyticTerrain} to supply terrain queries.
+  \item Returns \texttt{in\_contact}, \texttt{depth}, \texttt{mu}, and the contact frame axes.
+\end{itemize}
+
+\subsection{Correctness and Scope Notes}
+\begin{itemize}
+  \item The oracle does \emph{not} modify Chrono code.
+  \item For key functionality (vertical curve table, damping, patch forces, disc collision), the oracle
+        calls Chrono's actual implementations.
+  \item For certain sub-expressions (rolling resistance smoothing, slip definitions), Chrono does not provide
+        an isolated callable function; the oracle mirrors Chrono's equations for those quantities.
+        This is acceptable for substep~0 because the goal is to create a stable ground-truth interface.
+        If desired later, these can be upgraded to full \texttt{Synchronize/Advance}-based queries.
+\end{itemize}
+
+\subsection{How This Will Be Used in Later Substeps}
+\begin{itemize}
+  \item Substep~2 (static tire math): tests will call \texttt{normal\_stiffness\_force}, \texttt{normal\_load},
+        \texttt{fiala\_patch\_forces}, \texttt{rolling\_resistance\_moment}, and \texttt{fiala\_slip} as ground truth.
+  \item Substep~3 (collision pipeline): tests will call \texttt{disc\_terrain\_collision} for the Chrono reference.
+  \item The JSON protocol can be extended incrementally with new \texttt{cmd} values without changing the Python side.
+\end{itemize}
+
