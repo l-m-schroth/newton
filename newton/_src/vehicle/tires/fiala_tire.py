@@ -362,7 +362,7 @@ def _wp_interp_get_val(x: float, xs: wp.array(dtype=float), ys: wp.array(dtype=f
         return y_last
 
     idx = int(1)
-    while idx < n and xs[idx] <= x:
+    while idx < n and xs[idx] <= x: # NOTE (Lukas): If bisection search is possible, would be more efficient
         idx += 1
 
     x_prev = xs[idx - 1]

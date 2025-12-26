@@ -1,0 +1,195 @@
+% Substep 2 documentation (Static tire model transfer: Fiala)
+%
+% This file documents the implementation work done in substep 2 of the tire-model
+% porting plan: a pure-math port of Chrono's Fiala tire computations (no physics engine),
+% validated against Chrono as ground truth via the CLI oracle from substep 0.
+%
+\section{Substep 2: Static Tire Model Transfer (Fiala, Pure Math)}
+\label{sec:substep2-static-fiala}
+
+\subsection{Goal}
+Implement the relevant Chrono Fiala tire functionality as a \emph{pure math} module in Newton, in a way that:
+\begin{itemize}
+  \item matches Chrono outputs (within tolerance) for the same inputs,
+  \item is unit-testable without MuJoCo/Newton simulation state,
+  \item ends with a warp-batched implementation suitable for parallel RL (at least \texttt{nworld=2}).
+\end{itemize}
+Chrono remains the ground-truth reference; we do not modify Chrono to make tests pass.
+
+\subsection{What Was Added (Files)}
+\begin{itemize}
+  \item \texttt{newton/newton/\_src/vehicle/tires/fiala\_tire.py}:
+    Chrono-like Fiala tire math (Python + Warp kernel).
+  \item \texttt{newton/newton/\_src/vehicle/\_\_init\_\_.py} and
+        \texttt{newton/newton/\_src/vehicle/tires/\_\_init\_\_.py}:
+    Minimal package plumbing for the new vehicle/tire module.
+  \item \texttt{newton/newton/tests/tires/test\_fiala\_math.py}:
+    Python \texttt{unittest} suite comparing Newton outputs to Chrono ground truth via the substep~0 CLI oracle.
+\end{itemize}
+
+\subsection{Design Overview}
+\subsubsection{Chrono-like structure and naming}
+To keep the port auditable, the Newton implementation mirrors Chrono's structure:
+\begin{itemize}
+  \item \texttt{ChFialaTire} (math for slip, patch forces, rolling resistance),
+  \item \texttt{FialaTire} (adds normal stiffness/damping and the optional vertical curve table).
+\end{itemize}
+Each ported function includes a short ``Chrono reference'' marker pointing at the original Chrono source.
+
+\subsubsection{No engine dependencies}
+The implementation deliberately avoids MuJoCo and Newton solver state.
+Inputs are simple scalars (e.g.\ $v_x, v_y, \omega, \texttt{depth}, \mu$) and outputs are forces/moments computed from these.
+
+\subsection{Implemented Functionality}
+\subsubsection{Chrono vehicle JSON loading (including commented JSON)}
+Chrono vehicle JSON files in this workspace can contain C++-style comments (e.g.\ \texttt{HMMWV\_FialaTire.json}).
+To stay compatible and avoid bringing in Chrono's C++ JSON parser into Python, we added a small comment stripper:
+\begin{itemize}
+  \item \texttt{\_strip\_json\_comments(...)}: removes \texttt{// ...} and \texttt{/* ... */} outside of strings.
+  \item \texttt{load\_chrono\_vehicle\_json(...)} uses this before \texttt{json.loads}.
+\end{itemize}
+
+\subsubsection{Normal force law (stiffness + damping + clamp)}
+We replicate the parts of Chrono used by \texttt{ChFialaTire::Synchronize}:
+\begin{itemize}
+  \item Normal stiffness:
+    \begin{itemize}
+      \item linear model: $F_{z,\text{stiff}} = k\,\texttt{depth}$
+      \item vertical curve table (if present): piecewise-linear interpolation for in-range \texttt{depth},
+            linear extrapolation beyond the last point using the last-segment slope
+    \end{itemize}
+    (Chrono reference: \texttt{chrono/src/chrono\_vehicle/wheeled\_vehicle/tire/FialaTire.cpp::GetNormalStiffnessForce})
+  \item Normal damping:
+    \[
+      F_{z,\text{damp}} = c \cdot \texttt{velocity}
+    \]
+    (Chrono reference: \texttt{.../FialaTire.cpp::GetNormalDampingForce})
+  \item Normal load used by the tire model:
+    Chrono uses a sign flip for the damping velocity component:
+    \[
+      F_z = F_{z,\text{stiff}}(\texttt{depth}) + F_{z,\text{damp}}(\texttt{depth}, -v_z),\quad F_z \leftarrow \max(0, F_z)
+    \]
+    (Chrono reference: \texttt{.../ChFialaTire.cpp::Synchronize})
+\end{itemize}
+
+\subsubsection{Slip definitions and low-speed behavior}
+We match Chrono's internal slip definition used in \texttt{ChFialaTire::Advance}:
+\begin{itemize}
+  \item effective rolling radius $r_{\mathrm{eff}} = R - \texttt{depth}$,
+  \item \texttt{vsx = v\_x - omega * r\_eff},
+  \item \texttt{kappa = -vsx / abs(v\_x)}, \texttt{alpha = atan2(v\_y, abs(v\_x))},
+  \item special case: if \texttt{abs(v\_x) == 0} then \texttt{kappa = alpha = 0}.
+\end{itemize}
+(Chrono reference: \texttt{chrono/src/chrono\_vehicle/wheeled\_vehicle/tire/ChFialaTire.cpp::Advance})
+
+\subsubsection{Fiala patch forces}
+We ported \texttt{ChFialaTire::FialaPatchForces}:
+\begin{itemize}
+  \item Combined slip magnitude: \texttt{SsA = min(1, sqrt(kappa\^2 + tan(alpha)\^2))}.
+  \item Friction envelope: \texttt{U = UMAX - (UMAX-UMIN)*SsA}.
+  \item Critical thresholds:
+    \texttt{S\_critical = abs(U*fz/(2*CSLIP))},
+    \texttt{Alpha\_critical = atan(3*U*fz/CALPHA)}.
+  \item Friction scaling:
+    \[
+      U \leftarrow U \cdot \frac{\mu}{\mu_0}
+    \]
+  \item Longitudinal and lateral force branches, including aligning moment $M_z$, match Chrono exactly (same sign conventions).
+\end{itemize}
+(Chrono reference: \texttt{chrono/src/chrono\_vehicle/wheeled\_vehicle/tire/ChFialaTire.cpp::FialaPatchForces})
+
+\subsubsection{Friction clamping (\texttt{ChClampValue})}
+Chrono clamps the terrain friction coefficient in \texttt{ChFialaTire::Synchronize}:
+\[
+  \mu \in [0.1, 1.0]
+\]
+We replicate this behavior in \texttt{SetMu(..., clamp\_mu=True)} and use it in both Python and Warp versions.
+
+\subsubsection{Rolling resistance smoothing (Chrono sine-step)}
+Chrono uses a sine-step ramp from 0 to 1 as \texttt{abs\_vx} increases from 0.125 to 0.5, then computes:
+\[
+  M_y = -\texttt{startup(abs\_vx)} \cdot \texttt{rolling\_resistance} \cdot F_z \cdot \mathrm{sign}(\omega)
+\]
+We ported \texttt{ChFunctionSineStep::Eval} and \texttt{ChSignum} to reproduce this behavior.
+(Chrono reference: \texttt{.../ChFialaTire.cpp::Advance} and \texttt{chrono/src/chrono/functions/ChFunctionSineStep.cpp::Eval})
+
+\subsubsection{Convenience ``Advance'' equivalent for static tests}
+The method \texttt{FialaTire.AdvancePure(...)} provides an engine-independent version of the Chrono update:
+\begin{enumerate}
+  \item clamp \texttt{mu} (optional),
+  \item compute normal load $F_z$,
+  \item compute \texttt{kappa, alpha},
+  \item compute \texttt{Fx, Fy, Mz} via patch forces,
+  \item compute rolling resistance moment \texttt{My}.
+\end{enumerate}
+This makes it easy to unit test a larger chunk of behavior than individual helper functions.
+
+\subsection{Warp-Batched Implementation}
+\subsubsection{Kernel: \texttt{fiala\_tire\_advance\_kernel}}
+To support massively-parallel execution, we implemented a Warp kernel that computes the same outputs for a batch of inputs:
+\begin{itemize}
+  \item per-world inputs: \texttt{vx, vy, vel\_z, omega, depth, mu},
+  \item scalar tire parameters: loaded once from the JSON and passed as kernel arguments,
+  \item optional vertical curve table: passed as arrays \texttt{vert\_xs, vert\_ys} plus metadata (size, max depth/value, slope).
+\end{itemize}
+Outputs per world include \texttt{fx, fy, fz, my, mz, kappa, alpha}.
+
+\subsubsection{Helper: \texttt{run\_fiala\_tire\_advance\_batched}}
+This helper wraps kernel launches and returns Python lists, intended for unit tests and early validation.
+It is explicitly marked as CPU-capable; GPU support is expected to work when CUDA is available.
+
+\paragraph{Note on Warp cache path in this environment}
+In this workspace, Warp's default cache directory under \texttt{\$HOME/.cache/warp} may not be writable.
+Tests can set \texttt{WARP\_CACHE\_PATH} to a writable location (e.g.\ \texttt{./.cache/warp}) when running.
+
+\subsection{Unit Tests (Chrono Ground Truth)}
+\subsubsection{Test file}
+\texttt{newton/newton/tests/tires/test\_fiala\_math.py}
+
+\subsubsection{Ground truth source}
+All tests use the Chrono CLI oracle from substep~0 via \texttt{run\_chrono\_gt(...)}:
+\begin{itemize}
+  \item normal stiffness and damping: \texttt{cmd=normal\_stiffness\_force}, \texttt{cmd=normal\_damping\_force}
+  \item normal load (Chrono \texttt{Synchronize} behavior): \texttt{cmd=normal\_load}
+  \item patch forces: \texttt{cmd=fiala\_patch\_forces}
+  \item rolling resistance: \texttt{cmd=rolling\_resistance\_moment}
+  \item slip bookkeeping for batched validation: \texttt{cmd=fiala\_slip}
+\end{itemize}
+
+\subsubsection{Validation order (two tire JSONs)}
+The test suite explicitly validates both configurations:
+\begin{enumerate}
+  \item \texttt{chrono/build/data/vehicle/generic/tire/FialaTire.json} (linear vertical stiffness)
+  \item \texttt{chrono/build/data/vehicle/hmmwv/tire/HMMWV\_FialaTire.json} (nonlinear vertical curve table)
+\end{enumerate}
+
+\subsubsection{What is tested}
+\begin{itemize}
+  \item \textbf{Normal stiffness law}:
+    matches Chrono for multiple depths, including extrapolation behavior for the HMMWV curve table.
+  \item \textbf{Normal damping law}:
+    matches Chrono for multiple velocities and both tires.
+  \item \textbf{Normal load clamp}:
+    matches Chrono's \texttt{Fn\_mag < 0 -> 0} behavior.
+  \item \textbf{Patch forces + friction clamping}:
+    validates \texttt{Fx, Fy, Mz} including cases where \texttt{mu} is outside \texttt{[0.1, 1.0]}.
+  \item \textbf{Rolling resistance moment}:
+    validates \texttt{My} including sign flips with \texttt{omega} and the sine-step ramp behavior.
+  \item \textbf{Warp-batched pipeline (\texttt{nworld=2})}:
+    compares the Warp kernel outputs against Chrono-derived ground truth for two worlds in one call.
+\end{itemize}
+
+\subsubsection{Tolerances}
+We use strict tolerances for the scalar Python port (expected to match Chrono numerically very closely),
+and looser default tolerances for the Warp kernel (float32 and codegen differences).
+This is intentional and aligned with the ``match within tolerance'' requirement.
+
+\subsubsection{How to run}
+From the \texttt{newton/} repo directory:
+\begin{verbatim}
+WARP_CACHE_PATH=$(pwd)/.cache/warp \
+  .venv/bin/python -m unittest -v newton.tests.tires.test_fiala_math
+\end{verbatim}
+\noindent
+If the Chrono oracle binary is missing, build it as described in \texttt{newton/newton/tests/tires/chrono\_gt/README.md}.
+

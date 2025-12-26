@@ -54,6 +54,7 @@ class TestFialaMathAgainstChrono(unittest.TestCase):
     def test_normal_stiffness_force_vertical_curve_table(self):
         tire_json = _chrono_tire_path("vehicle/hmmwv/tire/HMMWV_FialaTire.json")
         tire = FialaTire.from_json(tire_json)
+        self.assertTrue(tire.m_has_vert_table)
 
         depths = [-0.01, 0.0, 0.0123, 0.08, 0.09]
         for depth in depths:
@@ -224,7 +225,86 @@ class TestFialaMathAgainstChrono(unittest.TestCase):
             for i in range(2):
                 for k in ["kappa", "alpha", "fx", "fy", "fz", "mz", "my"]:
                     with self.subTest(tire=rel, impl="warp", key=k, idx=i):
-                        _assert_close(self, batched[k][i], gt_all[i][k], rtol=5e-5, atol=1e-5)
+                        _assert_close(self, batched[k][i], gt_all[i][k], rtol=1e-5, atol=1e-5)
+
+    def test_batched_advance_matches_python_for_additional_cases_nworld_2(self):
+        wp.init()
+
+        for rel in ["vehicle/generic/tire/FialaTire.json", "vehicle/hmmwv/tire/HMMWV_FialaTire.json"]:
+            tire_json = _chrono_tire_path(rel)
+            tire = FialaTire.from_json(tire_json)
+
+            cases: list[dict[str, list[float]]] = [
+                # Explicit low-speed branch: slip and rolling resistance should be zeroed when vx == 0.
+                {
+                    "vx": [0.0, 0.0],
+                    "vy": [0.5, -0.2],
+                    "vel_z": [0.0, 0.0],
+                    "omega": [10.0, -10.0],
+                    "depth": [0.02, 0.02],
+                    "mu": [0.8, 0.8],
+                },
+                # Rolling resistance sine-step mid-range, and sign handling for omega.
+                {
+                    "vx": [0.2, 0.3],
+                    "vy": [0.05, -0.15],
+                    "vel_z": [0.0, 0.1],
+                    "omega": [5.0, -5.0],
+                    "depth": [0.02, 0.04],
+                    "mu": [0.8, 0.8],
+                },
+                # Mu clamping in the warp path (warp always clamps).
+                {
+                    "vx": [2.0, 2.0],
+                    "vy": [0.1, -0.3],
+                    "vel_z": [0.0, 0.1],
+                    "omega": [5.0, -5.0],
+                    "depth": [0.02, 0.02],
+                    "mu": [-1.0, 10.0],
+                },
+                # No-contact style case (negative penetration): fz should clamp to 0, and forces should remain finite.
+                {
+                    "vx": [1.0, -1.0],
+                    "vy": [0.2, -0.2],
+                    "vel_z": [0.0, 0.0],
+                    "omega": [0.0, 0.0],
+                    "depth": [-0.02, -0.01],
+                    "mu": [0.8, 0.8],
+                },
+            ]
+
+            if tire.m_has_vert_table:
+                cases.append(
+                    # Extrapolation beyond the last vertical curve table entry.
+                    {
+                        "vx": [1.0, 1.0],
+                        "vy": [0.1, -0.1],
+                        "vel_z": [0.0, 0.0],
+                        "omega": [10.0, -10.0],
+                        "depth": [tire.m_max_depth + 0.01, tire.m_max_depth + 0.02],
+                        "mu": [0.8, 0.8],
+                    }
+                )
+
+            for case_idx, c in enumerate(cases):
+                with self.subTest(tire=rel, case_idx=case_idx):
+                    py0 = tire.AdvancePure(c["vx"][0], c["vy"][0], c["vel_z"][0], c["omega"][0], c["depth"][0], c["mu"][0])
+                    py1 = tire.AdvancePure(c["vx"][1], c["vy"][1], c["vel_z"][1], c["omega"][1], c["depth"][1], c["mu"][1])
+
+                    batched = run_fiala_tire_advance_batched(
+                        tire,
+                        c["vx"],
+                        c["vy"],
+                        c["vel_z"],
+                        c["omega"],
+                        c["depth"],
+                        c["mu"],
+                        device="cpu",
+                    )
+                    for i, py in enumerate([py0, py1]):
+                        for k in ["kappa", "alpha", "fx", "fy", "fz", "mz", "my"]:
+                            with self.subTest(tire=rel, case_idx=case_idx, impl="warp_vs_python", key=k, idx=i):
+                                _assert_close(self, batched[k][i], py[k], rtol=1e-5, atol=1e-5)
 
 
 if __name__ == "__main__":
