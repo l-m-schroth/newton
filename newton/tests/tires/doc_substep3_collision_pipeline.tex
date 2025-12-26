@@ -1,0 +1,320 @@
+\section{Substep 3: Collision Pipeline Transfer (Disc--Terrain Collision)}
+
+\subsection{Goal and scope}
+This substep ports Chrono's \texttt{ChTire::DiscTerrainCollision} algorithms into Newton in an \emph{engine-independent} way.
+The port is intended to be used later by the Newton/MuJoCo-Warp integration to compute tire contact information
+(contact frame, penetration depth, and friction coefficient) without relying on MuJoCo's contact solver.
+
+\paragraph{Ground truth}
+Chrono is the reference.
+All unit tests compare the Newton implementation against Chrono outputs, obtained via the Chrono ground-truth CLI
+(\texttt{newton/newton/tests/tires/chrono\_gt/newton\_chrono\_gt.cpp}).
+
+\subsection{What was implemented}
+
+\subsubsection{Engine-independent collision module}
+A new module was added:
+\begin{itemize}
+  \item \texttt{newton/newton/\_src/vehicle/tires/disc\_terrain\_collision.py}
+\end{itemize}
+
+It provides a direct port of Chrono's disc--terrain collision routines:
+\begin{itemize}
+  \item \texttt{ConstructAreaDepthTable(disc\_radius, areaDep)}
+  \item \texttt{DiscTerrainCollision1pt(...)} (single-point method)
+  \item \texttt{DiscTerrainCollision4pt(...)} (four-point method)
+  \item \texttt{DiscTerrainCollisionEnvelope(...)} (envelope method, based on Sui \& Hirshey II)
+  \item \texttt{DiscTerrainCollision(...)} dispatcher selecting the method
+\end{itemize}
+
+\paragraph{Chrono reference locations (for auditing)}
+Each ported routine follows Chrono line-by-line logic and early-exit conditions:
+\begin{itemize}
+  \item \texttt{chrono/src/chrono\_vehicle/wheeled\_vehicle/ChTire.cpp::DiscTerrainCollision1pt}
+  \item \texttt{chrono/src/chrono\_vehicle/wheeled\_vehicle/ChTire.cpp::DiscTerrainCollision4pt}
+  \item \texttt{chrono/src/chrono\_vehicle/wheeled\_vehicle/ChTire.cpp::DiscTerrainCollisionEnvelope}
+  \item \texttt{chrono/src/chrono\_vehicle/wheeled\_vehicle/ChTire.cpp::ConstructAreaDepthTable}
+\end{itemize}
+
+\subsubsection{Chrono collision mode logic (illustrated)}
+Chrono models the wheel as a \emph{rigid disc} of radius \(R\) at center \(\mathbf{c}\), with unit disc normal
+\(\mathbf{n}_d\) (all in the global/world frame).
+Chrono assumes a Z-up world frame and uses the world vertical
+\(\mathbf{e}_z = (0,0,1)\).
+
+\paragraph{Shared primitives}
+All three modes use the following recurring computations (with Chrono names in parentheses):
+\begin{itemize}
+  \item \textbf{Wheel forward direction} (\texttt{wheel\_forward}):
+    \[
+      \mathbf{f} = \frac{\mathbf{n}_d \times \mathbf{e}_z}{\lVert \mathbf{n}_d \times \mathbf{e}_z \rVert}.
+    \]
+  \item \textbf{A point near the ``bottom'' of the disc in the world-vertical direction}
+    (\texttt{wheel\_bottom\_location}):
+    \[
+      \mathbf{p}_b = \mathbf{c} + R\,(\mathbf{n}_d \times \mathbf{f}).
+    \]
+  \item \textbf{Terrain queries use a vertical offset} (\texttt{voffset}): Chrono queries height/normal at
+    \(\mathbf{x} + \alpha R\,\mathbf{e}_z\) for some \(\alpha \in \{1,2\}\), i.e.\ above the expected surface, to
+    avoid sampling beneath the terrain representation. Newton reproduces the exact same offsets.
+\end{itemize}
+
+\paragraph{Mode 1: Single Point (\texttt{DiscTerrainCollision1pt})}
+This mode uses a single terrain sample near the bottom of the disc and then performs a first-order geometric
+correction using the sampled terrain normal.
+
+\begin{enumerate}
+  \item Query terrain properties (height \(h_c\), normal \(\mathbf{n}\), friction \(\mu\)) at
+    \(\mathbf{p}_b + 2R\,\mathbf{e}_z\).
+  \item Early reject if the disc center is at/below the terrain height:
+    \[
+      \mathbf{c}\cdot\mathbf{e}_z \le h_c \;\Rightarrow\; \text{no contact}.
+    \]
+  \item Compute a \emph{preliminary} depth at \(\mathbf{p}_b\) using the sampled normal:
+    \[
+      d_0 = (h_c - \mathbf{p}_b\cdot\mathbf{e}_z)\,(\mathbf{e}_z\cdot\mathbf{n}).
+    \]
+  \item Compute a direction which captures the disc tilt relative to the sampled normal:
+    \[
+      \mathbf{t} = \mathbf{n}_d \times \mathbf{n}.
+    \]
+    If \(\lVert \mathbf{t}\rVert^2 < 10^{-3}\), Chrono treats the disc as (almost) horizontal and returns no contact.
+  \item Normalize \(\mathbf{t}\) and correct the depth:
+    \[
+      d = R - (R - d_0)\,(\mathbf{f}\cdot \hat{\mathbf{t}}).
+    \]
+    If \(d \le 0\), there is no contact.
+  \item Compute the contact point on the disc:
+    \[
+      \mathbf{p}_c = \mathbf{c} + (R-d)\,(\mathbf{n}_d \times \hat{\mathbf{t}}).
+    \]
+  \item Construct the contact frame axes:
+    \[
+      \mathbf{x} = \frac{\mathbf{n}_d \times \mathbf{n}}{\lVert \mathbf{n}_d \times \mathbf{n} \rVert},\quad
+      \mathbf{y} = \mathbf{n} \times \mathbf{x},\quad
+      \mathbf{z} = \mathbf{n}.
+    \]
+\end{enumerate}
+
+\noindent
+The corresponding Chrono-style pseudocode is essentially:
+\begin{verbatim}
+pb = c + R * cross(nd, normalize(cross(nd, ez)))
+(hc, n, mu) = terrain.GetProperties(pb + 2R*ez)
+if height(c) <= hc: return no_contact
+d0 = (hc - height(pb)) * dot(ez, n)
+t = cross(nd, n); if |t|^2 < 1e-3: return no_contact
+d  = R - (R - d0) * dot(f, normalize(t)); if d <= 0: return no_contact
+pc = c + (R - d) * cross(nd, normalize(t))
+frame = (x=normalize(cross(nd,n)), y=cross(n,x), z=n)
+\end{verbatim}
+
+\paragraph{Mode 2: Four Points (\texttt{DiscTerrainCollision4pt})}
+This mode samples four points around the disc bottom location to estimate local surface curvature and a smoothed
+terrain normal.
+
+\begin{enumerate}
+  \item As in 1pt, sample terrain at \(\mathbf{p}_b + 2R\mathbf{e}_z\) and reject if \(\mathbf{c}\cdot\mathbf{e}_z \le h_c\).
+  \item Compute \(\mathbf{t} = \mathbf{n}_d \times \mathbf{n}\). If \(\lVert\mathbf{t}\rVert^2 < 10^{-3}\): no contact.
+  \item Define longitudinal/lateral directions (based on sampled \(\mathbf{n}\)):
+    \[
+      \mathbf{x} = \frac{\mathbf{n}_d \times \mathbf{n}}{\lVert \mathbf{n}_d \times \mathbf{n}\rVert},\quad
+      \mathbf{y} = \mathbf{n} \times \mathbf{x}.
+    \]
+  \item Compute an initial patch center on the disc:
+    \[
+      \mathbf{p}_0 = \mathbf{c} + R\,(\mathbf{n}_d \times \hat{\mathbf{t}}).
+    \]
+  \item Sample four points around \(\mathbf{p}_0\) using fixed offsets
+        \(d_x = 0.1R\), \(d_y = 0.3\,\text{width}\):
+    \[
+      \mathbf{Q}_1=\mathbf{p}_0+d_x\mathbf{x},\;
+      \mathbf{Q}_2=\mathbf{p}_0-d_x\mathbf{x},\;
+      \mathbf{Q}_3=\mathbf{p}_0+d_y\mathbf{y},\;
+      \mathbf{Q}_4=\mathbf{p}_0-d_y\mathbf{y}.
+    \]
+    Each \(\mathbf{Q}_i\) is projected onto the terrain height field by replacing its \(z\)-coordinate with the terrain height.
+  \item Compute a smoothed terrain normal:
+    \[
+      \mathbf{n}_{\text{smooth}} = \frac{(\mathbf{Q}_1-\mathbf{Q}_2)\times(\mathbf{Q}_3-\mathbf{Q}_4)}
+                                        {\lVert(\mathbf{Q}_1-\mathbf{Q}_2)\times(\mathbf{Q}_3-\mathbf{Q}_4)\rVert}.
+    \]
+  \item Use the average \(\mathbf{p}_c = \tfrac{1}{4}\sum_i \mathbf{Q}_i\) as the contact point and compute
+        \(d=\lVert \mathbf{p}_c-\mathbf{c}\rVert\). If \(d \ge R\): no contact. Otherwise penetration depth is \(R-d\).
+\end{enumerate}
+
+\paragraph{Mode 3: Envelope (\texttt{DiscTerrainCollisionEnvelope})}
+This method computes an \emph{overlap area} \(A\) between the terrain height profile and the disc contour along a
+longitudinal line. It then converts \(A\) to an \emph{equivalent penetration depth} using a precomputed lookup table.
+
+\begin{enumerate}
+  \item Query an initial terrain normal \(\mathbf{n}\) at \(\mathbf{c} + R\mathbf{e}_z\) and define
+    \(\mathbf{x}=\text{normalize}(\mathbf{n}_d\times \mathbf{n})\).
+  \item Numerically integrate the overlap area along \(x\in[-R,R]\) using \(n_{\text{div}}=180\) samples.
+        For each sample \(x\), define \(\mathbf{p}(x)=\mathbf{c}+x\mathbf{x}\),
+        \[
+          q(x)=h(\mathbf{p}(x) + R\mathbf{e}_z),\qquad
+          a(x)=\mathbf{p}(x)\cdot\mathbf{e}_z - \sqrt{R^2-x^2},
+        \]
+        where \(a(x)\) is the disc contour height along the cut line. Accumulate only where \(q(x) > a(x)\):
+        \[
+          A \approx \Delta x\sum_i \max(0, q(x_i)-a(x_i)).
+        \]
+        If \(A=0\): no contact.
+  \item Convert area to equivalent depth \(d\) using an area-to-depth map \texttt{areaDep}.
+        Chrono constructs this map from the circle segment area formula:
+        \[
+          \alpha(d) = 2\arccos\!\left(1-\frac{d}{R}\right),\qquad
+          \text{Area}(d)=\frac{1}{2}R^2\left(\alpha(d) - \sin(\alpha(d))\right).
+        \]
+        \texttt{ConstructAreaDepthTable} tabulates \((\text{Area}(d), d)\) for \(d\in[0,R]\) and \texttt{areaDep.GetVal(A)}
+        performs interpolation.
+  \item With the estimated depth \(d\), compute the lowest point on the disc in the direction implied by the terrain normal:
+        let \(\mathbf{t} = \mathbf{n}_d\times\mathbf{n}\); if \(\lVert\mathbf{t}\rVert^2 < 10^{-3}\): no contact.
+        Then
+        \[
+          \mathbf{p}_c = \mathbf{c} + (R-d)\,(\mathbf{n}_d \times \hat{\mathbf{t}}).
+        \]
+  \item Re-query terrain at/around \(\mathbf{p}_c\) to define the final contact frame and friction.
+\end{enumerate}
+
+\subsubsection{Minimal terrain query interface}
+Chrono's collision utilities query a \texttt{ChTerrain} object for:
+\texttt{GetHeight}, \texttt{GetNormal}, \texttt{GetCoefficientFriction}, and \texttt{GetProperties}.
+To keep this substep engine-independent, the Newton module introduces:
+\begin{itemize}
+  \item \texttt{TerrainQuery} (Python \texttt{Protocol}) expressing the minimal required API.
+  \item \texttt{AnalyticTerrain} implementing two simple terrains:
+    \begin{itemize}
+      \item \textbf{Plane}: height field derived from a point+normal or a constant \texttt{height}.
+      \item \textbf{Sinusoid}: \(z = \text{base} + \text{amp}\sin(\text{freq}x)\sin(\text{freq}y)\).
+    \end{itemize}
+\end{itemize}
+
+\paragraph{Why a dedicated terrain abstraction?}
+Chrono's collision code is written against a \texttt{ChTerrain} interface.
+To make Newton's port auditable and directly comparable to Chrono without involving MuJoCo/Newton simulation state,
+we replicate only the minimum terrain-query surface required by the collision routines.
+This also enables unit tests with deterministic ``toy terrains'' (plane and sinusoid).
+
+\subsubsection{Contact frame: matching Chrono's quaternion round-trip}
+Chrono computes a contact coordinate system \(\{\mathbf{x},\mathbf{y},\mathbf{z}\}\) as follows:
+\begin{enumerate}
+  \item Build a rotation matrix from direction axes (Chrono: \texttt{ChMatrix33::SetFromDirectionAxes}).
+  \item Store it in the \texttt{ChCoordsys} as a quaternion (Chrono: \texttt{rot.GetQuaternion()}).
+\end{enumerate}
+
+In the Chrono ground-truth CLI, we output contact axes by converting the quaternion back to a matrix
+(Chrono: \texttt{ChMatrix33(contact.rot)} then \texttt{GetAxisX/Y/Z}).
+
+\paragraph{Important nuance (4pt method)}
+In \texttt{DiscTerrainCollision4pt}, the ``longitudinal'' and ``lateral'' axes used to build the matrix are
+not explicitly orthonormalized with the final ``terrain\_normal''.
+Therefore, the quaternion conversion (matrix \(\rightarrow\) quaternion \(\rightarrow\) matrix)
+implicitly normalizes the rotation, and the axes returned by Chrono's API are the \emph{round-tripped axes},
+not necessarily the original non-orthonormal columns.
+
+\paragraph{Newton implementation choice}
+To match Chrono's reported outputs exactly, Newton replicates this behavior in pure Python with:
+\begin{itemize}
+  \item \texttt{\_axes\_via\_chrono\_quat\_roundtrip(x\_axis, y\_axis, z\_axis)}
+\end{itemize}
+This function implements Chrono's exact algorithms from:
+\begin{itemize}
+  \item \texttt{chrono/src/chrono/core/ChMatrix33.h::GetQuaternion}
+  \item \texttt{chrono/src/chrono/core/ChMatrix33.h::SetFromQuaternion}
+\end{itemize}
+and is applied when producing \texttt{ContactPatch.x\_axis/y\_axis/z\_axis}.
+
+\subsection{Warp-batched implementation (for later parallel RL use)}
+While substep 3 is engine-independent, the Newton collision port already includes a batched Warp path so the
+collision logic can be evaluated across multiple worlds efficiently (required later by the MuJoCo-Warp pipeline).
+
+\paragraph{What is batched}
+The module provides:
+\begin{itemize}
+  \item Warp kernels for each collision mode:
+    \texttt{\_disc\_collision\_1pt\_kernel},
+    \texttt{\_disc\_collision\_4pt\_kernel},
+    \texttt{\_disc\_collision\_envelope\_kernel}.
+  \item A Python wrapper:
+    \texttt{run\_disc\_terrain\_collision\_batched(...)} returning per-world arrays for
+    \texttt{in\_contact}, \texttt{depth}, \texttt{mu}, and contact frame axes/position.
+\end{itemize}
+
+\paragraph{Terrain support in the batched path}
+To keep this step engine-independent, the Warp path supports the same analytic terrains
+(plane and sinusoid) via simple closed-form height/normal functions.
+
+\paragraph{Warp-specific note}
+Warp requires dynamic loop accumulators to be explicitly ``dynamic'' variables.
+For the envelope algorithm's integration loop, the kernel uses the form:
+\begin{verbatim}
+A = float(0.0)
+i = float(1.0)
+while i < 180.0:
+    ...
+    i = i + 1.0
+\end{verbatim}
+to satisfy Warp's codegen constraints.
+
+\subsection{Tests implemented}
+All tests are standard \texttt{unittest} tests and compare Newton outputs to Chrono ground truth.
+
+\subsubsection{New test file}
+\begin{itemize}
+  \item \texttt{newton/newton/tests/tires/test\_disc\_terrain\_collision.py}
+\end{itemize}
+
+\subsubsection{Test coverage}
+\begin{enumerate}
+  \item \textbf{Flat ground (plane), all modes:}
+    \begin{itemize}
+      \item One case with contact (disc center slightly below radius above the plane).
+      \item One case without contact (disc center slightly above radius above the plane).
+      \item Validated for \texttt{SINGLE\_POINT}, \texttt{FOUR\_POINTS}, and \texttt{ENVELOPE}.
+    \end{itemize}
+
+  \item \textbf{Non-trivial terrain (sinusoid), all modes:}
+    \begin{itemize}
+      \item A configuration that produces contact.
+      \item Validates \texttt{in\_contact}, \texttt{depth}, \texttt{mu}, and the contact frame.
+    \end{itemize}
+
+  \item \textbf{Warp-batched validation (nworld=2):}
+    \begin{itemize}
+      \item Batched evaluation on a plane for all modes.
+      \item Compares Warp outputs directly to Chrono ground truth for each world (with practical tolerances).
+    \end{itemize}
+\end{enumerate}
+
+\paragraph{Tolerances}
+\begin{itemize}
+  \item Pure Python (Newton) vs Chrono: tight tolerances for geometry-related quantities (\(\sim 10^{-10}\) absolute),
+        but slightly looser for \(\mu\) because the Chrono API returns \(\mu\) as \texttt{float} (float32) in the CLI
+        and we compare against a Python \texttt{float} (double).
+  \item Warp vs Chrono: practical tolerances (\(\sim 10^{-5}\)) as in the substep 2 Warp tests.
+\end{itemize}
+
+\subsection{How to run}
+\paragraph{Prerequisites}
+\begin{itemize}
+  \item The Chrono ground-truth CLI must be built (substep 0). If missing, tests will fail with build instructions.
+  \item Warp needs a writable cache directory. In this repository, we set it to a workspace-local path.
+\end{itemize}
+
+\paragraph{Commands}
+\begin{verbatim}
+cd newton
+mkdir -p .cache/warp
+WARP_CACHE_PATH=$(pwd)/.cache/warp .venv/bin/python -m unittest -v \
+  newton.tests.tires.test_disc_terrain_collision
+\end{verbatim}
+
+\subsection{Notes / limitations (intentional for this substep)}
+\begin{itemize}
+  \item The terrain-query implementation is intentionally minimal and analytic; later substeps will connect the
+        collision logic to MuJoCo/Newton terrain representations.
+  \item Contact results are provided as a contact point, contact frame axes, penetration depth, and friction
+        coefficient---matching the data needed by Chrono-like tire models to compute forces.
+\end{itemize}
