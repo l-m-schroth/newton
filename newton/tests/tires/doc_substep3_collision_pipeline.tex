@@ -39,58 +39,66 @@ Each ported routine follows Chrono line-by-line logic and early-exit conditions:
 \subsubsection{Chrono collision mode logic (illustrated)}
 Chrono models the wheel as a \emph{rigid disc} of radius \(R\) at center \(\mathbf{c}\), with unit disc normal
 \(\mathbf{n}_d\) (all in the global/world frame).
-Chrono assumes a Z-up world frame and uses the world vertical
-\(\mathbf{e}_z = (0,0,1)\).
+Chrono uses the world vertical direction (Chrono: \texttt{ChWorldFrame::Vertical()}).
+In the default ISO/Z-up convention this is \(\mathbf{e}_z = (0,0,1)\).
 
 \paragraph{Shared primitives}
-All three modes use the following recurring computations (with Chrono names in parentheses):
+All three modes use the following recurring computations (with Chrono names in parentheses).
+These are geometric helpers; no forces are computed here.
 \begin{itemize}
   \item \textbf{Wheel forward direction} (\texttt{wheel\_forward}):
     \[
       \mathbf{f} = \frac{\mathbf{n}_d \times \mathbf{e}_z}{\lVert \mathbf{n}_d \times \mathbf{e}_z \rVert}.
     \]
+    This is the wheel ``rolling'' direction on flat ground (undefined if \(\mathbf{n}_d\parallel \mathbf{e}_z\)).
   \item \textbf{A point near the ``bottom'' of the disc in the world-vertical direction}
     (\texttt{wheel\_bottom\_location}):
     \[
       \mathbf{p}_b = \mathbf{c} + R\,(\mathbf{n}_d \times \mathbf{f}).
     \]
+    This is the rim point which is lowest in the \(-\mathbf{e}_z\) direction (i.e.\ \(-\mathbf{e}_z\) projected into the disc plane).
   \item \textbf{Terrain queries use a vertical offset} (\texttt{voffset}): Chrono queries height/normal at
     \(\mathbf{x} + \alpha R\,\mathbf{e}_z\) for some \(\alpha \in \{1,2\}\), i.e.\ above the expected surface, to
     avoid sampling beneath the terrain representation. Newton reproduces the exact same offsets.
 \end{itemize}
 
 \paragraph{Mode 1: Single Point (\texttt{DiscTerrainCollision1pt})}
-This mode uses a single terrain sample near the bottom of the disc and then performs a first-order geometric
-correction using the sampled terrain normal.
+High-level idea: sample the terrain once, treat the terrain locally as a plane (using the sampled normal), then compute
+an approximate disc--plane intersection point and a corresponding penetration depth.
+This is a first-order approximation (most accurate on locally planar/constant-slope terrain).
 
 \begin{enumerate}
-  \item Query terrain properties (height \(h_c\), normal \(\mathbf{n}\), friction \(\mu\)) at
+  \item Compute \(\mathbf{p}_b\) and query terrain properties (height \(h_c\), normal \(\mathbf{n}\), friction \(\mu\)) at
     \(\mathbf{p}_b + 2R\,\mathbf{e}_z\).
-  \item Early reject if the disc center is at/below the terrain height:
+    (Chrono does \emph{not} re-query \(\mu\) at the final contact point in this mode; it uses this sampled value.)
+  \item Early reject if the disc center is at/below the sampled terrain height:
     \[
       \mathbf{c}\cdot\mathbf{e}_z \le h_c \;\Rightarrow\; \text{no contact}.
     \]
-  \item Compute a \emph{preliminary} depth at \(\mathbf{p}_b\) using the sampled normal:
+  \item Compute a preliminary penetration estimate using the terrain height under \(\mathbf{p}_b\):
     \[
       d_0 = (h_c - \mathbf{p}_b\cdot\mathbf{e}_z)\,(\mathbf{e}_z\cdot\mathbf{n}).
     \]
-  \item Compute a direction which captures the disc tilt relative to the sampled normal:
+    Here, \((h_c - \mathbf{p}_b\!\cdot\!\mathbf{e}_z)\) is the \emph{vertical} gap, while \((\mathbf{e}_z\!\cdot\!\mathbf{n})\) projects it
+    onto the sampled terrain normal direction.
+  \item Compute the slope-aware rolling direction (Chrono later calls this \texttt{longitudinal}):
     \[
-      \mathbf{t} = \mathbf{n}_d \times \mathbf{n}.
+      \mathbf{x} = \mathbf{n}_d \times \mathbf{n}.
     \]
-    If \(\lVert \mathbf{t}\rVert^2 < 10^{-3}\), Chrono treats the disc as (almost) horizontal and returns no contact.
-  \item Normalize \(\mathbf{t}\) and correct the depth:
+    If \(\lVert \mathbf{x}\rVert^2 < 10^{-3}\), Chrono treats the disc as (almost) horizontal and returns no contact.
+  \item Normalize \(\mathbf{x}\) and correct the depth:
     \[
-      d = R - (R - d_0)\,(\mathbf{f}\cdot \hat{\mathbf{t}}).
+      d = R - (R - d_0)\,(\mathbf{f}\cdot \hat{\mathbf{x}}).
     \]
     If \(d \le 0\), there is no contact.
+    On flat terrain, \(\hat{\mathbf{x}}=\mathbf{f}\) and this reduces to \(d=d_0\).
   \item Compute the contact point on the disc:
     \[
-      \mathbf{p}_c = \mathbf{c} + (R-d)\,(\mathbf{n}_d \times \hat{\mathbf{t}}).
+      \mathbf{p}_c = \mathbf{c} + (R-d)\,(\mathbf{n}_d \times \hat{\mathbf{x}}).
     \]
-  \item Construct the contact frame axes:
+  \item Construct the contact frame axes (Chrono returns these via a quaternion round-trip):
     \[
-      \mathbf{x} = \frac{\mathbf{n}_d \times \mathbf{n}}{\lVert \mathbf{n}_d \times \mathbf{n} \rVert},\quad
+      \mathbf{x}=\hat{\mathbf{x}},\quad
       \mathbf{y} = \mathbf{n} \times \mathbf{x},\quad
       \mathbf{z} = \mathbf{n}.
     \]
@@ -99,14 +107,16 @@ correction using the sampled terrain normal.
 \noindent
 The corresponding Chrono-style pseudocode is essentially:
 \begin{verbatim}
-pb = c + R * cross(nd, normalize(cross(nd, ez)))
+f = normalize(cross(nd, ez))
+pb = c + R * cross(nd, f)
 (hc, n, mu) = terrain.GetProperties(pb + 2R*ez)
 if height(c) <= hc: return no_contact
 d0 = (hc - height(pb)) * dot(ez, n)
-t = cross(nd, n); if |t|^2 < 1e-3: return no_contact
-d  = R - (R - d0) * dot(f, normalize(t)); if d <= 0: return no_contact
-pc = c + (R - d) * cross(nd, normalize(t))
-frame = (x=normalize(cross(nd,n)), y=cross(n,x), z=n)
+x = cross(nd, n); if |x|^2 < 1e-3: return no_contact
+x = normalize(x)
+d = R - (R - d0) * dot(f, x); if d <= 0: return no_contact
+pc = c + (R - d) * cross(nd, x)
+frame = (x=x, y=cross(n,x), z=n)
 \end{verbatim}
 
 \paragraph{Mode 2: Four Points (\texttt{DiscTerrainCollision4pt})}

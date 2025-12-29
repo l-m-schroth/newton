@@ -192,6 +192,9 @@ class AnalyticTerrain final : public chrono::vehicle::ChTerrain {
         }
 
         // z = f(x,y); normal ~ (-df/dx, -df/dy, 1)
+        // NOTE (Lukas): F(x,y,z) = f(x,y) - z = 0 defines the surface. ∇F is a normal to the surface.
+        // consider any curve r  on surface F(r(t), then clearly d​F/dt(r(t))=∇F(r(t))⋅r′(t) = 0, r′(t) is any tangent vector.
+        // In simple terms: Surface is defined as a level curve. Gradient is always orthogonal to level curves. 
         const double sx = std::sin(m_freq * loc.x());
         const double sy = std::sin(m_freq * loc.y());
         const double cx = std::cos(m_freq * loc.x());
