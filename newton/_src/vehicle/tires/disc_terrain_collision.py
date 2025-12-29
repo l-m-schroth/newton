@@ -444,7 +444,10 @@ class AnalyticTerrain:
         return float(self.base + self.amp * math.sin(self.freq * loc[0]) * math.sin(self.freq * loc[1]))
 
     def GetNormal(self, loc: Vec3) -> Vec3:
-        # Chrono reference: newton/newton/tests/tires/chrono_gt/newton_chrono_gt.cpp::AnalyticTerrain::GetNormal
+        # As in newton/newton/tests/tires/chrono_gt/newton_chrono_gt.cpp::AnalyticTerrain::GetNormal
+        # NOTE (Lukas): F(x,y,z) = f(x,y) - z = 0 defines the surface. ∇F is a normal to the surface.
+        # consider any curve r  on surface F(r(t), then clearly d​F/dt(r(t))=∇F(r(t))⋅r′(t) = 0, r′(t) is any tangent vector.
+        # In simple terms: Surface is defined as a level curve. Gradient is always orthogonal to level curves. 
         if self.type == TerrainType.PLANE:
             return self.normal
 
@@ -496,7 +499,9 @@ def _wp_normalize(a: wp.vec3) -> wp.vec3:
 def _wp_height(p: wp.vec3) -> float:
     return p[2]
 
-
+# NOTE (Lukas): Currently the terrain height and normals are obtained from these functions, which are part of the warp kernel. 
+# Thus the height and normal function is hardcoded.
+# At a later point, I need to find a way to cleanly integrate it in a general way which Mujoco/ Newton's terrain representation. 
 @wp.func
 def _wp_terrain_height(
     loc: wp.vec3,
