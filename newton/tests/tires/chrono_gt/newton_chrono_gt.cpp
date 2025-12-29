@@ -6,9 +6,12 @@
 #include <cmath>
 #include <exception>
 #include <iostream>
+#include <memory>
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <array>
+#include <vector>
 
 #include "chrono/functions/ChFunctionSineStep.h"
 #include "chrono/utils/ChUtils.h"
@@ -78,6 +81,22 @@ chrono::ChVector3d GetVec3(const rj::Value& v, const char* key) {
         Throw(std::string("expected vec3 array for key: ") + key);
     }
     return chrono::ChVector3d(a[0u].GetDouble(), a[1u].GetDouble(), a[2u].GetDouble());
+}
+
+std::array<double, 4> GetVec4(const rj::Value& v, const char* key) {
+    if (!v.HasMember(key)) {
+        Throw(std::string("missing key: ") + key);
+    }
+    const auto& a = v[key];
+    if (!a.IsArray() || a.Size() != 4) {
+        Throw(std::string("expected vec4 array for key: ") + key);
+    }
+    return {
+        a[0u].GetDouble(),
+        a[1u].GetDouble(),
+        a[2u].GetDouble(),
+        a[3u].GetDouble(),
+    };
 }
 
 void AddVec3(rj::Value& out_obj, rj::Document::AllocatorType& alloc, const char* key, const chrono::ChVector3d& v) {
@@ -231,7 +250,164 @@ class AnalyticTerrain final : public chrono::vehicle::ChTerrain {
     double m_freq = 1.0;
 };
 
-AnalyticTerrain ParseTerrain(const rj::Value& req) {
+class HFieldTerrain final : public chrono::vehicle::ChTerrain {
+  public:
+    struct Params {
+        std::array<double, 4> size = {1.0, 1.0, 1.0, 0.1};  // (x, y, z_top, z_bottom)
+        int nrow = 0;
+        int ncol = 0;
+        std::vector<float> data;
+        chrono::ChVector3d pos = chrono::ChVector3d(0, 0, 0);  // base plane origin
+        float mu = 0.8f;
+    };
+
+    static HFieldTerrain Make(const Params& p) {
+        HFieldTerrain t;
+        t.m_size = p.size;
+        t.m_nrow = p.nrow;
+        t.m_ncol = p.ncol;
+        t.m_data = p.data;
+        t.m_pos = p.pos;
+        t.m_mu = p.mu;
+        return t;
+    }
+
+    double GetHeight(const chrono::ChVector3d& loc) const override {
+        // MuJoCo reference: mujoco/src/engine/engine_collision_convex.c::mjc_ConvexHField (grid layout)
+        // MuJoCo reference: mujoco/src/engine/engine_ray.c::mj_rayHfieldNormal (triangulation)
+        if (m_nrow < 2 || m_ncol < 2 || m_data.empty()) {
+            return m_pos.z();
+        }
+
+        const double size_x = m_size[0];
+        const double size_y = m_size[1];
+        const double size_z = m_size[2];  // z_top
+
+        const double dx = (2.0 * size_x) / double(m_ncol - 1);
+        const double dy = (2.0 * size_y) / double(m_nrow - 1);
+        if (dx == 0.0 || dy == 0.0) {
+            return m_pos.z();
+        }
+
+        const double x = loc.x() - m_pos.x();
+        const double y = loc.y() - m_pos.y();
+
+        double u = (x + size_x) / dx;
+        double v = (y + size_y) / dy;
+        u = chrono::ChClamp(u, 0.0, double(m_ncol - 1));
+        v = chrono::ChClamp(v, 0.0, double(m_nrow - 1));
+
+        int c = int(std::floor(u));
+        int r = int(std::floor(v));
+        if (c > m_ncol - 2) {
+            c = m_ncol - 2;
+        }
+        if (r > m_nrow - 2) {
+            r = m_nrow - 2;
+        }
+
+        const double tx = u - double(c);
+        const double ty = v - double(r);
+
+        auto h = [&](int rr, int cc) -> double { return double(m_data[rr * m_ncol + cc]) * size_z; };
+        const double h00 = h(r, c);
+        const double h10 = h(r, c + 1);
+        const double h01 = h(r + 1, c);
+        const double h11 = h(r + 1, c + 1);
+
+        double z = 0.0;
+        if (tx >= ty) {
+            // tri1 (v00, v11, v10): weights w00=1-tx, w10=tx-ty, w11=ty
+            z = (1.0 - tx) * h00 + (tx - ty) * h10 + ty * h11;
+        } else {
+            // tri2 (v00, v01, v11): weights w00=1-ty, w01=ty-tx, w11=tx
+            z = (1.0 - ty) * h00 + (ty - tx) * h01 + tx * h11;
+        }
+
+        return m_pos.z() + z;
+    }
+
+    chrono::ChVector3d GetNormal(const chrono::ChVector3d& loc) const override {
+        if (m_nrow < 2 || m_ncol < 2 || m_data.empty()) {
+            return chrono::ChVector3d(0, 0, 1);
+        }
+
+        const double size_x = m_size[0];
+        const double size_y = m_size[1];
+        const double size_z = m_size[2];  // z_top
+
+        const double dx = (2.0 * size_x) / double(m_ncol - 1);
+        const double dy = (2.0 * size_y) / double(m_nrow - 1);
+        if (dx == 0.0 || dy == 0.0) {
+            return chrono::ChVector3d(0, 0, 1);
+        }
+
+        const double x = loc.x() - m_pos.x();
+        const double y = loc.y() - m_pos.y();
+
+        double u = (x + size_x) / dx;
+        double v = (y + size_y) / dy;
+        u = chrono::ChClamp(u, 0.0, double(m_ncol - 1));
+        v = chrono::ChClamp(v, 0.0, double(m_nrow - 1));
+
+        int c = int(std::floor(u));
+        int r = int(std::floor(v));
+        if (c > m_ncol - 2) {
+            c = m_ncol - 2;
+        }
+        if (r > m_nrow - 2) {
+            r = m_nrow - 2;
+        }
+
+        const double tx = u - double(c);
+        const double ty = v - double(r);
+
+        auto h = [&](int rr, int cc) -> double { return double(m_data[rr * m_ncol + cc]) * size_z; };
+        const double h00 = h(r, c);
+        const double h10 = h(r, c + 1);
+        const double h01 = h(r + 1, c);
+        const double h11 = h(r + 1, c + 1);
+
+        chrono::ChVector3d n(0, 0, 1);
+        if (tx >= ty) {
+            // normal ~ cross(v10-v00, v11-v00)
+            const double dz10 = h10 - h00;
+            const double dz11 = h11 - h00;
+            n = chrono::ChVector3d(-dz10 * dy, dx * (dz10 - dz11), dx * dy);
+        } else {
+            // normal ~ cross(v11-v00, v01-v00)
+            const double dz01 = h01 - h00;
+            const double dz11 = h11 - h00;
+            n = chrono::ChVector3d(dy * (dz01 - dz11), -dx * dz01, dx * dy);
+        }
+        n.Normalize();
+        return n;
+    }
+
+    float GetCoefficientFriction(const chrono::ChVector3d& loc) const override {
+        (void)loc;
+        return m_mu;
+    }
+
+    void GetProperties(const chrono::ChVector3d& loc,
+                       double& height,
+                       chrono::ChVector3d& normal,
+                       float& friction) const override {
+        height = GetHeight(loc);
+        normal = GetNormal(loc);
+        friction = GetCoefficientFriction(loc);
+    }
+
+  private:
+    std::array<double, 4> m_size = {1.0, 1.0, 1.0, 0.1};
+    int m_nrow = 0;
+    int m_ncol = 0;
+    std::vector<float> m_data;
+    chrono::ChVector3d m_pos = chrono::ChVector3d(0, 0, 0);
+    float m_mu = 0.8f;
+};
+
+std::unique_ptr<chrono::vehicle::ChTerrain> ParseTerrain(const rj::Value& req) {
     if (!req.HasMember("terrain")) {
         Throw("missing key: terrain");
     }
@@ -248,18 +424,49 @@ AnalyticTerrain ParseTerrain(const rj::Value& req) {
         // - {"type":"plane","point":[...],"normal":[...],"mu":0.8}
         if (t.HasMember("height")) {
             const double h = GetNumber(t, "height");
-            return AnalyticTerrain::MakePlane(chrono::ChVector3d(0, 0, h), chrono::ChVector3d(0, 0, 1), mu);
+            return std::make_unique<AnalyticTerrain>(
+                AnalyticTerrain::MakePlane(chrono::ChVector3d(0, 0, h), chrono::ChVector3d(0, 0, 1), mu));
         }
         const auto p = GetVec3(t, "point");
         const auto n = GetVec3(t, "normal");
-        return AnalyticTerrain::MakePlane(p, n, mu);
+        return std::make_unique<AnalyticTerrain>(AnalyticTerrain::MakePlane(p, n, mu));
     }
 
     if (type == "sinusoid") {
         const double base = GetNumber(t, "base");
         const double amp = GetNumber(t, "amp");
         const double freq = GetNumber(t, "freq");
-        return AnalyticTerrain::MakeSinusoid(base, amp, freq, mu);
+        return std::make_unique<AnalyticTerrain>(AnalyticTerrain::MakeSinusoid(base, amp, freq, mu));
+    }
+
+    if (type == "hfield") {
+        HFieldTerrain::Params p;
+        p.mu = mu;
+        p.size = GetVec4(t, "size");
+        p.nrow = int(GetNumber(t, "nrow"));
+        p.ncol = int(GetNumber(t, "ncol"));
+        if (p.nrow <= 0 || p.ncol <= 0) {
+            Throw("hfield: nrow/ncol must be > 0");
+        }
+        if (!t.HasMember("data") || !t["data"].IsArray()) {
+            Throw("hfield: expected array 'data'");
+        }
+        const auto& a = t["data"];
+        if (int(a.Size()) != p.nrow * p.ncol) {
+            Throw("hfield: data length must match nrow*ncol");
+        }
+        p.data.resize(p.nrow * p.ncol);
+        for (int i = 0; i < p.nrow * p.ncol; ++i) {
+            if (!a[i].IsNumber()) {
+                Throw("hfield: expected numeric data entries");
+            }
+            p.data[i] = float(a[i].GetDouble());
+        }
+
+        if (t.HasMember("pos")) {
+            p.pos = GetVec3(t, "pos");
+        }
+        return std::make_unique<HFieldTerrain>(HFieldTerrain::Make(p));
     }
 
     Throw(std::string("unsupported terrain.type: ") + type);
@@ -442,7 +649,7 @@ int main(int argc, char** argv) {
             TireAccess::ConstructAreaDepthTablePublic(disc_radius, area_dep);
 
             const bool in_contact = TireAccess::DiscTerrainCollisionPublic(
-                method, terrain, disc_center, disc_normal, disc_radius, width, area_dep, contact, depth, mu);
+                method, *terrain, disc_center, disc_normal, disc_radius, width, area_dep, contact, depth, mu);
 
             resp.AddMember("in_contact", in_contact, alloc);
             resp.AddMember("depth", depth, alloc);

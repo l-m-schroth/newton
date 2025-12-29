@@ -14,9 +14,10 @@
 # limitations under the License.
 
 from .fiala_tire import ChFialaTire, FialaTire
+from .mujoco_tire_module import MujocoFialaTireModule
 
 __all__ = [
     "ChFialaTire",
     "FialaTire",
+    "MujocoFialaTireModule",
 ]
-

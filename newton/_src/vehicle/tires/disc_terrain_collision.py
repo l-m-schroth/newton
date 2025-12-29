@@ -550,6 +550,163 @@ def _wp_terrain_normal(
     return _wp_normalize(wp.vec3(-dfdx, -dfdy, 1.0))
 
 
+# --------------------------------------------------------------------------------------
+# MuJoCo terrain query helpers (plane + heightfield)
+# --------------------------------------------------------------------------------------
+#
+# These functions implement a minimal Chrono-style terrain query interface (height/normal)
+# for MuJoCo terrain geoms. They are used in the MuJoCo-Warp tire integration (substep 4).
+#
+# Note: We intentionally only support MuJoCo `plane` and `hfield` geoms here.
+
+_MJ_GEOM_PLANE = 0  # mujoco.mjtGeom.mjGEOM_PLANE
+_MJ_GEOM_HFIELD = 1  # mujoco.mjtGeom.mjGEOM_HFIELD
+
+
+@wp.func
+def _wp_hfield_height_normal_local(
+    x: float,
+    y: float,
+    size_x: float,
+    size_y: float,
+    size_z_top: float,
+    nrow: int,
+    ncol: int,
+    adr: int,
+    hfield_data: wp.array(dtype=float),
+) -> wp.vec4:
+    # MuJoCo reference: mujoco/src/engine/engine_collision_convex.c::mjc_ConvexHField (grid layout)
+    # MuJoCo reference: mujoco/src/engine/engine_ray.c::mj_rayHfieldNormal (triangulation)
+    #
+    # Heightfield local frame:
+    #   x in [-size_x, size_x], y in [-size_y, size_y], z in [0, size_z_top]
+    # Vertex heights are `hfield_data * size_z_top` (data range [0, 1]).
+    #
+    # Triangulation per cell uses the diagonal v00 -> v11:
+    #   tri1: (v00, v11, v10) for (tx >= ty)
+    #   tri2: (v00, v01, v11) for (tx <  ty)
+
+    # Default flat result (also used for degenerate grids).
+    height = float(0.0)
+    normal = wp.vec3(0.0, 0.0, 1.0)
+
+    if nrow < 2 or ncol < 2:
+        return wp.vec4(height, normal[0], normal[1], normal[2])
+
+    dx = (2.0 * size_x) / float(ncol - 1)
+    dy = (2.0 * size_y) / float(nrow - 1)
+    if dx == 0.0 or dy == 0.0:
+        return wp.vec4(height, normal[0], normal[1], normal[2])
+
+    u = (x + size_x) / dx
+    v = (y + size_y) / dy
+
+    # Clamp to the grid domain.
+    u = wp.min(wp.max(u, 0.0), float(ncol - 1))
+    v = wp.min(wp.max(v, 0.0), float(nrow - 1))
+
+    c = int(wp.floor(u))
+    r = int(wp.floor(v))
+    if c > ncol - 2:
+        c = ncol - 2
+    if r > nrow - 2:
+        r = nrow - 2
+
+    tx = u - float(c)
+    ty = v - float(r)
+
+    idx00 = adr + r * ncol + c
+    idx10 = adr + r * ncol + (c + 1)
+    idx01 = adr + (r + 1) * ncol + c
+    idx11 = adr + (r + 1) * ncol + (c + 1)
+
+    h00 = hfield_data[idx00] * size_z_top
+    h10 = hfield_data[idx10] * size_z_top
+    h01 = hfield_data[idx01] * size_z_top
+    h11 = hfield_data[idx11] * size_z_top
+
+    if tx >= ty:
+        # tri1 (v00, v11, v10): weights w00=1-tx, w10=tx-ty, w11=ty
+        height = (1.0 - tx) * h00 + (tx - ty) * h10 + ty * h11
+
+        dz10 = h10 - h00
+        dz11 = h11 - h00
+        # normal ~ cross(v10-v00, v11-v00)
+        normal = _wp_normalize(wp.vec3(-dz10 * dy, dx * (dz10 - dz11), dx * dy))
+    else:
+        # tri2 (v00, v01, v11): weights w00=1-ty, w01=ty-tx, w11=tx
+        height = (1.0 - ty) * h00 + (ty - tx) * h01 + tx * h11
+
+        dz01 = h01 - h00
+        dz11 = h11 - h00
+        # normal ~ cross(v11-v00, v01-v00)
+        normal = _wp_normalize(wp.vec3(dy * (dz01 - dz11), -dx * dz01, dx * dy))
+
+    return wp.vec4(height, normal[0], normal[1], normal[2])
+
+
+@wp.func
+def _wp_mujoco_terrain_height_normal(
+    loc: wp.vec3,
+    worldid: int,
+    terrain_geom_id: int,
+    geom_type: wp.array(dtype=int),
+    geom_dataid: wp.array(dtype=int),
+    geom_xpos: wp.array2d(dtype=wp.vec3),
+    geom_xmat: wp.array2d(dtype=wp.mat33),
+    hfield_size: wp.array(dtype=wp.vec4),
+    hfield_nrow: wp.array(dtype=int),
+    hfield_ncol: wp.array(dtype=int),
+    hfield_adr: wp.array(dtype=int),
+    hfield_data: wp.array(dtype=float),
+) -> wp.vec4:
+    gtype = geom_type[terrain_geom_id]
+
+    pos = geom_xpos[worldid, terrain_geom_id]
+    mat = geom_xmat[worldid, terrain_geom_id]
+    az = wp.vec3(mat[0, 2], mat[1, 2], mat[2, 2])
+
+    if gtype == _MJ_GEOM_PLANE:
+        n = _wp_normalize(az)
+        nz = n[2]
+        if wp.abs(nz) < 1e-12:
+            return wp.vec4(pos[2], n[0], n[1], n[2])
+        dx = loc[0] - pos[0]
+        dy = loc[1] - pos[1]
+        dz = -(n[0] * dx + n[1] * dy) / nz
+        h = pos[2] + dz
+        return wp.vec4(h, n[0], n[1], n[2])
+
+    if gtype == _MJ_GEOM_HFIELD:
+        hid = geom_dataid[terrain_geom_id]
+        size = hfield_size[hid]
+        nrow = hfield_nrow[hid]
+        ncol = hfield_ncol[hid]
+        adr = hfield_adr[hid]
+
+        ax = wp.vec3(mat[0, 0], mat[1, 0], mat[2, 0])
+        ay = wp.vec3(mat[0, 1], mat[1, 1], mat[2, 1])
+
+        # Terrain height/normal are functions of (x, y) only. Ignore query z to keep this invariant.
+        delta = wp.vec3(loc[0] - pos[0], loc[1] - pos[1], 0.0)
+        x_local = wp.dot(delta, ax)
+        y_local = wp.dot(delta, ay)
+
+        hn = _wp_hfield_height_normal_local(x_local, y_local, size[0], size[1], size[2], nrow, ncol, adr, hfield_data)
+        h_local = hn[0]
+        n_local = wp.vec3(hn[1], hn[2], hn[3])
+
+        # World-space height is the z-coordinate of the surface point with local coords (x_local, y_local, h_local).
+        h_world = pos[2] + ax[2] * x_local + ay[2] * y_local + az[2] * h_local
+
+        # Rotate normal into world frame.
+        n_world = _wp_normalize(ax * n_local[0] + ay * n_local[1] + az * n_local[2])
+        return wp.vec4(h_world, n_world[0], n_world[1], n_world[2])
+
+    # Unsupported terrain type: treat as a flat plane at geom position.
+    return wp.vec4(pos[2], 0.0, 0.0, 1.0)
+
+
 @wp.func
 def _wp_interp_get_val(x: float, xs: wp.array(dtype=float), ys: wp.array(dtype=float), n: int) -> float:
     # Chrono reference: chrono/src/chrono/functions/ChFunctionInterp.cpp::GetVal

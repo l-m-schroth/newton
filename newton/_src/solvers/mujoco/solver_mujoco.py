@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import os
 import warnings
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Sequence
 
 import numpy as np
 import warp as wp
@@ -75,6 +75,25 @@ else:
     MjData = object
     MjWarpModel = object
     MjWarpData = object
+
+
+@wp.kernel
+def _disable_geom_collisions_for_bodies_kernel(
+    geom_bodyid: wp.array(dtype=wp.int32),
+    body_ids: wp.array(dtype=wp.int32),
+    nbody_ids: int,
+    geom_contype_io: wp.array(dtype=wp.int32),
+    geom_conaffinity_io: wp.array(dtype=wp.int32),
+):
+    geom_id = wp.tid()
+    b = geom_bodyid[geom_id]
+    i = int(0)
+    while i < nbody_ids:
+        if b == body_ids[i]:
+            geom_contype_io[geom_id] = 0
+            geom_conaffinity_io[geom_id] = 0
+            break
+        i += 1
 
 
 class SolverMuJoCo(SolverBase):
@@ -336,6 +355,7 @@ class SolverMuJoCo(SolverBase):
         tolerance: float = 1e-6,
         ls_tolerance: float = 0.01,
         include_sites: bool = True,
+        tire_modules: Sequence[object] | None = None,
     ):
         """
         Args:
@@ -445,6 +465,37 @@ class SolverMuJoCo(SolverBase):
         if self.mjw_model is not None:
             self.mjw_model.opt.run_collision_detection = use_mujoco_contacts
 
+        self._tire_modules: list[object] = list(tire_modules) if tire_modules is not None else []
+        if self._tire_modules and self.mjw_model is not None:
+            # If tire modules are provided, install a Chrono-like tire force route via mjcb_control.
+            #
+            # The recommended usage is to disable wheel geoms from MuJoCo contact handling, so tire-ground
+            # interaction is handled purely via external forces (xfrc_applied) in the callback.
+            wheel_body_ids: list[int] = []
+            for mod in self._tire_modules:
+                wheel_ids = getattr(mod, "wheel_body_ids", None)
+                if wheel_ids is None:
+                    continue
+                wheel_body_ids.extend(int(x) for x in wheel_ids)
+
+            wheel_body_ids = sorted(set(wheel_body_ids))
+            if wheel_body_ids:
+                wheel_body_ids_wp = wp.array(wheel_body_ids, dtype=wp.int32, device=self.model.device)
+                wp.launch(
+                    _disable_geom_collisions_for_bodies_kernel,
+                    dim=self.mjw_model.ngeom,
+                    inputs=[
+                        self.mjw_model.geom_bodyid,
+                        wheel_body_ids_wp,
+                        int(len(wheel_body_ids)),
+                    ],
+                    outputs=[
+                        self.mjw_model.geom_contype,
+                        self.mjw_model.geom_conaffinity,
+                    ],
+                    device=self.model.device,
+                )
+
     @event_scope
     def mujoco_warp_step(self):
         self._mujoco_warp.step(self.mjw_model, self.mjw_data)
@@ -466,11 +517,28 @@ class SolverMuJoCo(SolverBase):
                 self.update_mjc_data(self.mjw_data, self.model, state_in)
             self.mjw_model.opt.timestep.fill_(dt)
             with wp.ScopedDevice(self.model.device):
-                if self.mjw_model.opt.run_collision_detection:
-                    self.mujoco_warp_step()
-                else:
-                    self.convert_contacts_to_mjwarp(self.model, state_in, contacts)
-                    self.mujoco_warp_step()
+                import mujoco_warp  # noqa: PLC0415
+
+                prev_cb = mujoco_warp.mjcb_control
+                if self._tire_modules:
+                    # Chain any existing callback.
+                    def _cb(m, d):  # noqa: ANN001
+                        if prev_cb is not None:
+                            prev_cb(m, d)
+                        for mod in self._tire_modules:
+                            apply = getattr(mod, "apply", None)
+                            if apply is not None:
+                                apply(m, d)
+
+                    mujoco_warp.mjcb_control = _cb
+                try:
+                    if self.mjw_model.opt.run_collision_detection:
+                        self.mujoco_warp_step()
+                    else:
+                        self.convert_contacts_to_mjwarp(self.model, state_in, contacts)
+                        self.mujoco_warp_step()
+                finally:
+                    mujoco_warp.mjcb_control = prev_cb
 
             self.update_newton_state(self.model, state_out, self.mjw_data)
         self._step += 1
