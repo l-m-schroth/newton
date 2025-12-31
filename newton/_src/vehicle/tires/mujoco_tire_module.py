@@ -109,7 +109,7 @@ def _wp_hfield_height_normal_local(
 
     c = int(wp.floor(u))
     r = int(wp.floor(v))
-    if c > ncol - 2:
+    if c > ncol - 2: # If lands exactly at the last row/ column, choose second last, need valid cells upwards and right. 
         c = ncol - 2
     if r > nrow - 2:
         r = nrow - 2
@@ -128,10 +128,16 @@ def _wp_hfield_height_normal_local(
     h11 = hfield_data[idx11] * size_z_top
 
     if tx >= ty:
+        # tri1 (v00, v11, v10): weights w00=1-tx, w10=tx-ty, w11=ty
+        # NOTE (Lukas): v00 = (r, c, h00), v10 = (r, c+1, h10), v11 = (r+1, c+1, h11)
+        # v_query = v00 + tx * (v10 - v00) + ty * (v11 - v10)
         height = (1.0 - tx) * h00 + (tx - ty) * h10 + ty * h11
 
         dz10 = h10 - h00
         dz11 = h11 - h00
+        # normal ~ cross(v10-v00, v11-v00)
+        # e1 = v10 - v00 = (dx, 0, h10 - h00) = (dx, 0, dz10)
+        # e2 = v11 - v00 = (dx, dy, h11 - h00) = (dx, dy, dz11)
         normal = _wp_normalize(wp.vec3(-dz10 * dy, dx * (dz10 - dz11), dx * dy))
     else:
         height = (1.0 - ty) * h00 + (ty - tx) * h01 + tx * h11

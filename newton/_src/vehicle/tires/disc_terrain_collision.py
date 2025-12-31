@@ -627,11 +627,15 @@ def _wp_hfield_height_normal_local(
 
     if tx >= ty:
         # tri1 (v00, v11, v10): weights w00=1-tx, w10=tx-ty, w11=ty
+        # NOTE (Lukas): v00 = (r, c, h00), v10 = (r, c+1, h10), v11 = (r+1, c+1, h11)
+        # v_query = v00 + tx * (v10 - v00) + ty * (v11 - v10)
         height = (1.0 - tx) * h00 + (tx - ty) * h10 + ty * h11
 
         dz10 = h10 - h00
         dz11 = h11 - h00
         # normal ~ cross(v10-v00, v11-v00)
+        # e1 = v10 - v00 = (dx, 0, h10 - h00) = (dx, 0, dz10)
+        # e2 = v11 - v00 = (dx, dy, h11 - h00) = (dx, dy, dz11)
         normal = _wp_normalize(wp.vec3(-dz10 * dy, dx * (dz10 - dz11), dx * dy))
     else:
         # tri2 (v00, v01, v11): weights w00=1-ty, w01=ty-tx, w11=tx
@@ -669,7 +673,7 @@ def _wp_mujoco_terrain_height_normal(
     if gtype == _MJ_GEOM_PLANE:
         n = _wp_normalize(az)
         nz = n[2]
-        if wp.abs(nz) < 1e-12:
+        if wp.abs(nz) < 1e-12: # vertical plane
             return wp.vec4(pos[2], n[0], n[1], n[2])
         dx = loc[0] - pos[0]
         dy = loc[1] - pos[1]

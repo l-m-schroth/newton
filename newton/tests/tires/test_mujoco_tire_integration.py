@@ -245,14 +245,12 @@ class TestMujocoWarpFialaTireIntegration(unittest.TestCase):
         qpos[1, 2] = 0.60
         d.qpos = wp.array(qpos, dtype=float, device=d.qpos.device)
 
-        # Sentinel to ensure the callback overwrites (MuJoCo does not clear xfrc_applied between RK4 stages).
-        d.xfrc_applied.fill_(wp.spatial_vector(123.0, -456.0, 789.0, 1.0, 2.0, 3.0))
-
         terrain = {"type": "plane", "height": 0.0, "mu": 0.8}
         wheel_id = int(mujoco.mj_name2id(mjm, mujoco.mjtObj.mjOBJ_BODY, "wheel"))
 
         for method in [CollisionType.SINGLE_POINT, CollisionType.FOUR_POINTS, CollisionType.ENVELOPE]:
             with self.subTest(method=method):
+                # Sentinel to ensure the callback overwrites (MuJoCo does not clear xfrc_applied between RK4 stages).
                 d.xfrc_applied.fill_(wp.spatial_vector(123.0, -456.0, 789.0, 1.0, 2.0, 3.0))
                 module = MujocoFialaTireModule.from_mujoco_names(
                     mjm,
@@ -294,8 +292,8 @@ class TestMujocoWarpFialaTireIntegration(unittest.TestCase):
                     act_m = tuple(float(x) for x in xfrc[worldid, wheel_id, 3:6])
 
                     for i in range(3):
-                        _assert_close(self, act_f[i], exp_f[i], rtol=2e-4, atol=5e-3)
-                        _assert_close(self, act_m[i], exp_m[i], rtol=2e-4, atol=5e-3)
+                        _assert_close(self, act_f[i], exp_f[i], rtol=2e-4, atol=5e-4)
+                        _assert_close(self, act_m[i], exp_m[i], rtol=2e-4, atol=5e-4)
 
     def test_hfield_matches_chrono_for_single_point_nworld_2(self):
         tire_json = _chrono_tire_path("vehicle/generic/tire/FialaTire.json")
