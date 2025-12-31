@@ -20,24 +20,18 @@ import os
 import unittest
 from pathlib import Path
 
-try:
-    import warp as wp  # noqa: F401
-    import mujoco  # noqa: F401
+import sys
 
-    # Import mujoco_warp as a package (not the workspace namespace dir).
-    import sys
+import mujoco
+import warp as wp
 
-    sys.path.insert(0, str(Path(__file__).resolve().parents[4] / "mujoco_warp"))
-    import mujoco_warp  # noqa: E402
+# Import mujoco_warp as a package (not the workspace namespace dir).
+sys.path.insert(0, str(Path(__file__).resolve().parents[4] / "mujoco_warp"))
+import mujoco_warp  # noqa: E402
 
-    _HAS_MJ_WARP = True
-except Exception:
-    _HAS_MJ_WARP = False
-
-if _HAS_MJ_WARP:
-    from newton._src.vehicle.tires import MujocoFialaTireModule
-    from newton._src.vehicle.tires.disc_terrain_collision import CollisionType
-    from newton.tests.tires.chrono_gt import run_chrono_gt
+from newton._src.vehicle.tires import MujocoFialaTireModule
+from newton._src.vehicle.tires.disc_terrain_collision import CollisionType, HFieldTerrain
+from newton.tests.tires.chrono_gt import run_chrono_gt
 
 
 def _repo_root() -> Path:
@@ -164,7 +158,6 @@ def _chronos_force_wrench_world(
     return force_world, moment_world
 
 
-@unittest.skipUnless(_HAS_MJ_WARP, "mujoco_warp/warp not available")
 class TestMujocoWarpFialaTireIntegration(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
@@ -175,8 +168,6 @@ class TestMujocoWarpFialaTireIntegration(unittest.TestCase):
         mujoco_warp.mj_resetCallbacks()
 
     def test_rk4_calls_mjcb_control_4_times_per_step(self):
-        tire_json = _chrono_tire_path("vehicle/generic/tire/FialaTire.json")
-
         xml = r"""
 <mujoco model="rk4_cb_count">
   <option timestep="0.01" integrator="RK4" gravity="0 0 -9.81"/>
@@ -195,19 +186,10 @@ class TestMujocoWarpFialaTireIntegration(unittest.TestCase):
         m = mujoco_warp.put_model(mjm)
         d = mujoco_warp.put_data(mjm, mjd, nworld=1)
 
-        module = MujocoFialaTireModule.from_mujoco_names(
-            mjm,
-            tire_json,
-            wheel_body_names=["wheel"],
-            terrain_geom_name="ground",
-            collision_type=CollisionType.SINGLE_POINT,
-        )
-
         calls = {"n": 0}
 
         def cb(m_cb, d_cb):  # noqa: ANN001
             calls["n"] += 1
-            module.apply(m_cb, d_cb)
 
         mujoco_warp.mjcb_control = cb
         mujoco_warp.step(m, d)
@@ -238,11 +220,15 @@ class TestMujocoWarpFialaTireIntegration(unittest.TestCase):
         m = mujoco_warp.put_model(mjm)
         d = mujoco_warp.put_data(mjm, mjd, nworld=2)
 
+        params = run_chrono_gt({"cmd": "get_params", "tire_json": tire_json})
+        self.assertTrue(params["ok"])
+        disc_radius = float(params["unloaded_radius"])
+
         qpos = d.qpos.numpy()
-        # world 0: in contact (depth ~ 0.05 for radius 0.5)
-        qpos[0, 2] = 0.45
+        # world 0: in contact (depth ~ 0.05)
+        qpos[0, 2] = disc_radius - 0.05
         # world 1: no contact
-        qpos[1, 2] = 0.60
+        qpos[1, 2] = disc_radius + 0.05
         d.qpos = wp.array(qpos, dtype=float, device=d.qpos.device)
 
         terrain = {"type": "plane", "height": 0.0, "mu": 0.8}
@@ -291,6 +277,15 @@ class TestMujocoWarpFialaTireIntegration(unittest.TestCase):
                     act_f = tuple(float(x) for x in xfrc[worldid, wheel_id, 0:3])
                     act_m = tuple(float(x) for x in xfrc[worldid, wheel_id, 3:6])
 
+                    if worldid == 0:
+                        self.assertGreater(exp_f[2], 0.0)
+                        self.assertGreater(act_f[2], 0.0)
+                    else:
+                        self.assertEqual(exp_f, (0.0, 0.0, 0.0))
+                        self.assertEqual(exp_m, (0.0, 0.0, 0.0))
+                        self.assertEqual(act_f, (0.0, 0.0, 0.0))
+                        self.assertEqual(act_m, (0.0, 0.0, 0.0))
+
                     for i in range(3):
                         _assert_close(self, act_f[i], exp_f[i], rtol=2e-4, atol=5e-4)
                         _assert_close(self, act_m[i], exp_m[i], rtol=2e-4, atol=5e-4)
@@ -333,25 +328,15 @@ class TestMujocoWarpFialaTireIntegration(unittest.TestCase):
         m = mujoco_warp.put_model(mjm)
         d = mujoco_warp.put_data(mjm, mjd, nworld=2)
 
-        qpos = d.qpos.numpy()
-        qpos[0, 2] = 0.45
-        qpos[1, 2] = 0.60
-        d.qpos = wp.array(qpos, dtype=float, device=d.qpos.device)
-
-        module = MujocoFialaTireModule.from_mujoco_names(
-            mjm,
-            tire_json,
-            wheel_body_names=["wheel"],
-            terrain_geom_name="ground",
-            collision_type=CollisionType.SINGLE_POINT,
-        )
-        mujoco_warp.mjcb_control = module.apply
-        mujoco_warp.forward(m, d)
+        params = run_chrono_gt({"cmd": "get_params", "tire_json": tire_json})
+        self.assertTrue(params["ok"])
+        disc_radius = float(params["unloaded_radius"])
 
         wheel_id = int(mujoco.mj_name2id(mjm, mujoco.mjtObj.mjOBJ_BODY, "wheel"))
 
         # Build Chrono terrain request matching MuJoCo's internal normalized hfield representation.
-        hid = int(mjm.geom_dataid[int(mujoco.mj_name2id(mjm, mujoco.mjtObj.mjOBJ_GEOM, "ground"))])
+        ground_geom_id = int(mujoco.mj_name2id(mjm, mujoco.mjtObj.mjOBJ_GEOM, "ground"))
+        hid = int(mjm.geom_dataid[ground_geom_id])
         size_arr = mjm.hfield_size
         if getattr(size_arr, "ndim", 1) == 2:
             size = size_arr[hid].tolist()
@@ -363,6 +348,32 @@ class TestMujocoWarpFialaTireIntegration(unittest.TestCase):
         data = mjm.hfield_data[adr : adr + nrow_m * ncol_m].tolist()
 
         terrain = {"type": "hfield", "mu": 0.7, "size": size, "nrow": nrow_m, "ncol": ncol_m, "data": data}
+
+        # Ensure one world has contact and the other does not (heightfield surface is generally not at z=0).
+        hf = HFieldTerrain(
+            size=tuple(float(x) for x in size),
+            nrow=nrow_m,
+            ncol=ncol_m,
+            data=data,
+            pos=(0.0, 0.0, 0.0),
+            mu=0.7,
+        )
+        h0 = float(hf.GetHeight((0.0, 0.0, 0.0)))
+
+        qpos = d.qpos.numpy()
+        qpos[0, 2] = disc_radius + h0 - 0.05
+        qpos[1, 2] = disc_radius + h0 + 0.05
+        d.qpos = wp.array(qpos, dtype=float, device=d.qpos.device)
+
+        module = MujocoFialaTireModule.from_mujoco_names(
+            mjm,
+            tire_json,
+            wheel_body_names=["wheel"],
+            terrain_geom_name="ground",
+            collision_type=CollisionType.SINGLE_POINT,
+        )
+        mujoco_warp.mjcb_control = module.apply
+        mujoco_warp.forward(m, d)
 
         xipos = d.xipos.numpy()
         xmat = d.xmat.numpy()
@@ -392,6 +403,15 @@ class TestMujocoWarpFialaTireIntegration(unittest.TestCase):
 
             act_f = tuple(float(x) for x in xfrc[worldid, wheel_id, 0:3])
             act_m = tuple(float(x) for x in xfrc[worldid, wheel_id, 3:6])
+
+            if worldid == 0:
+                self.assertGreater(exp_f[2], 0.0)
+                self.assertGreater(act_f[2], 0.0)
+            else:
+                self.assertEqual(exp_f, (0.0, 0.0, 0.0))
+                self.assertEqual(exp_m, (0.0, 0.0, 0.0))
+                self.assertEqual(act_f, (0.0, 0.0, 0.0))
+                self.assertEqual(act_m, (0.0, 0.0, 0.0))
 
             for i in range(3):
                 _assert_close(self, act_f[i], exp_f[i], rtol=3e-4, atol=1e-2)

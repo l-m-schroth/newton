@@ -467,6 +467,134 @@ class AnalyticTerrain:
         return (self.GetHeight(loc), self.GetNormal(loc), float(self.mu))
 
 
+@dataclasses.dataclass(slots=True)
+class HFieldTerrain:
+    """Simple axis-aligned heightfield terrain using MuJoCo's grid layout and triangulation.
+
+    This matches the ground-truth implementation in:
+      - newton/newton/tests/tires/chrono_gt/newton_chrono_gt.cpp::HFieldTerrain
+
+    Notes:
+      - The heightfield is axis-aligned (no rotation); only a translation `pos` is supported.
+      - Heights are computed from `data * size[2]`, consistent with the ground-truth CLI.
+    """
+
+    size: tuple[float, float, float, float]  # (size_x, size_y, size_z_top, size_z_bottom)
+    nrow: int
+    ncol: int
+    data: Sequence[float]
+    pos: Vec3 = (0.0, 0.0, 0.0)
+    mu: float = 0.8
+
+    def __post_init__(self) -> None:
+        self._validate()
+
+    def _validate(self) -> None:
+        if self.nrow <= 0 or self.ncol <= 0:
+            raise ValueError("HFieldTerrain: nrow/ncol must be > 0")
+        if len(self.data) != self.nrow * self.ncol:
+            raise ValueError("HFieldTerrain: data length must match nrow*ncol")
+
+    def GetHeight(self, loc: Vec3) -> float:
+        # Chrono reference: newton/newton/tests/tires/chrono_gt/newton_chrono_gt.cpp::HFieldTerrain::GetHeight
+        if self.nrow < 2 or self.ncol < 2 or len(self.data) == 0:
+            return float(self.pos[2])
+
+        size_x, size_y, size_z, _size_z_bottom = self.size
+        dx = (2.0 * size_x) / float(self.ncol - 1)
+        dy = (2.0 * size_y) / float(self.nrow - 1)
+        if dx == 0.0 or dy == 0.0:
+            return float(self.pos[2])
+
+        x = loc[0] - self.pos[0]
+        y = loc[1] - self.pos[1]
+
+        u = (x + size_x) / dx
+        v = (y + size_y) / dy
+        u = max(0.0, min(u, float(self.ncol - 1)))
+        v = max(0.0, min(v, float(self.nrow - 1)))
+
+        c = int(math.floor(u))
+        r = int(math.floor(v))
+        if c > self.ncol - 2:
+            c = self.ncol - 2
+        if r > self.nrow - 2:
+            r = self.nrow - 2
+
+        tx = u - float(c)
+        ty = v - float(r)
+
+        def h(rr: int, cc: int) -> float:
+            return float(self.data[rr * self.ncol + cc]) * float(size_z)
+
+        h00 = h(r, c)
+        h10 = h(r, c + 1)
+        h01 = h(r + 1, c)
+        h11 = h(r + 1, c + 1)
+
+        if tx >= ty:
+            z = (1.0 - tx) * h00 + (tx - ty) * h10 + ty * h11
+        else:
+            z = (1.0 - ty) * h00 + (ty - tx) * h01 + tx * h11
+
+        return float(self.pos[2] + z)
+
+    def GetNormal(self, loc: Vec3) -> Vec3:
+        # Chrono reference: newton/newton/tests/tires/chrono_gt/newton_chrono_gt.cpp::HFieldTerrain::GetNormal
+        if self.nrow < 2 or self.ncol < 2 or len(self.data) == 0:
+            return (0.0, 0.0, 1.0)
+
+        size_x, size_y, size_z, _size_z_bottom = self.size
+        dx = (2.0 * size_x) / float(self.ncol - 1)
+        dy = (2.0 * size_y) / float(self.nrow - 1)
+        if dx == 0.0 or dy == 0.0:
+            return (0.0, 0.0, 1.0)
+
+        x = loc[0] - self.pos[0]
+        y = loc[1] - self.pos[1]
+
+        u = (x + size_x) / dx
+        v = (y + size_y) / dy
+        u = max(0.0, min(u, float(self.ncol - 1)))
+        v = max(0.0, min(v, float(self.nrow - 1)))
+
+        c = int(math.floor(u))
+        r = int(math.floor(v))
+        if c > self.ncol - 2:
+            c = self.ncol - 2
+        if r > self.nrow - 2:
+            r = self.nrow - 2
+
+        tx = u - float(c)
+        ty = v - float(r)
+
+        def h(rr: int, cc: int) -> float:
+            return float(self.data[rr * self.ncol + cc]) * float(size_z)
+
+        h00 = h(r, c)
+        h10 = h(r, c + 1)
+        h01 = h(r + 1, c)
+        h11 = h(r + 1, c + 1)
+
+        if tx >= ty:
+            dz10 = h10 - h00
+            dz11 = h11 - h00
+            n = (-dz10 * dy, dx * (dz10 - dz11), dx * dy)
+        else:
+            dz01 = h01 - h00
+            dz11 = h11 - h00
+            n = (dy * (dz01 - dz11), -dx * dz01, dx * dy)
+
+        return _v_normalize(n)
+
+    def GetCoefficientFriction(self, loc: Vec3) -> float:
+        (void_loc,) = (loc,)
+        return float(self.mu)
+
+    def GetProperties(self, loc: Vec3) -> tuple[float, Vec3, float]:
+        return (self.GetHeight(loc), self.GetNormal(loc), float(self.mu))
+
+
 @wp.func
 def _wp_cross(a: wp.vec3, b: wp.vec3) -> wp.vec3:
     return wp.vec3(
@@ -691,8 +819,8 @@ def _wp_mujoco_terrain_height_normal(
         ax = wp.vec3(mat[0, 0], mat[1, 0], mat[2, 0])
         ay = wp.vec3(mat[0, 1], mat[1, 1], mat[2, 1])
 
-        # Terrain height/normal are functions of (x, y) only. Ignore query z to keep this invariant.
-        delta = wp.vec3(loc[0] - pos[0], loc[1] - pos[1], 0.0)
+        # Convert query location to the heightfield local frame (full 3D delta; z-component matters for rotated hfields).
+        delta = loc - pos
         x_local = wp.dot(delta, ax)
         y_local = wp.dot(delta, ay)
 
@@ -707,8 +835,874 @@ def _wp_mujoco_terrain_height_normal(
         n_world = _wp_normalize(ax * n_local[0] + ay * n_local[1] + az * n_local[2])
         return wp.vec4(h_world, n_world[0], n_world[1], n_world[2])
 
-    # Unsupported terrain type: treat as a flat plane at geom position.
-    return wp.vec4(pos[2], 0.0, 0.0, 1.0)
+    # Unsupported terrain type: return NaNs (caller should validate supported types on the host).
+    return wp.vec4(wp.nan, wp.nan, wp.nan, wp.nan)
+
+
+@wp.func
+def _wp_axes_via_chrono_quat_roundtrip(x_axis: wp.vec3, y_axis: wp.vec3, z_axis: wp.vec3) -> wp.mat33:
+    # Chrono reference: chrono/src/chrono/core/ChMatrix33.h::{SetFromDirectionAxes,GetQuaternion,SetFromQuaternion}
+    #
+    # Chrono stores the contact frame rotation as a quaternion (ChCoordsys::rot). When Chrono constructs a direction
+    # axes matrix and converts it to a quaternion, the downstream frame (converted back to a matrix) corresponds to
+    # the quaternion round-trip of those axes (important for `DiscTerrainCollision4pt`, where X/Y are not guaranteed
+    # to be orthogonal to the computed terrain normal).
+
+    # Matrix elements from SetFromDirectionAxes(X,Y,Z): columns are the axes.
+    m00 = x_axis[0]
+    m10 = x_axis[1]
+    m20 = x_axis[2]
+    m01 = y_axis[0]
+    m11 = y_axis[1]
+    m21 = y_axis[2]
+    m02 = z_axis[0]
+    m12 = z_axis[1]
+    m22 = z_axis[2]
+
+    half = 0.5
+    tr = m00 + m11 + m22
+
+    e0 = 0.0
+    e1 = 0.0
+    e2 = 0.0
+    e3 = 0.0
+
+    if tr >= 0.0:
+        s = wp.sqrt(tr + 1.0)
+        e0 = half * s
+        s = half / s
+        e1 = (m21 - m12) * s
+        e2 = (m02 - m20) * s
+        e3 = (m10 - m01) * s
+    else:
+        i = int(0)
+        if m11 > m00:
+            i = int(1)
+            if m22 > m11:
+                i = int(2)
+        else:
+            if m22 > m00:
+                i = int(2)
+
+        if i == 0:
+            s = wp.sqrt(m00 - m11 - m22 + 1.0)
+            e1 = half * s
+            s = half / s
+            e2 = (m01 + m10) * s
+            e3 = (m20 + m02) * s
+            e0 = (m21 - m12) * s
+        elif i == 1:
+            s = wp.sqrt(m11 - m22 - m00 + 1.0)
+            e2 = half * s
+            s = half / s
+            e3 = (m12 + m21) * s
+            e1 = (m01 + m10) * s
+            e0 = (m02 - m20) * s
+        else:
+            s = wp.sqrt(m22 - m00 - m11 + 1.0)
+            e3 = half * s
+            s = half / s
+            e1 = (m20 + m02) * s
+            e2 = (m12 + m21) * s
+            e0 = (m10 - m01) * s
+
+    # SetFromQuaternion(q)
+    e0e0 = e0 * e0
+    e1e1 = e1 * e1
+    e2e2 = e2 * e2
+    e3e3 = e3 * e3
+    e0e1 = e0 * e1
+    e0e2 = e0 * e2
+    e0e3 = e0 * e3
+    e1e2 = e1 * e2
+    e1e3 = e1 * e3
+    e2e3 = e2 * e3
+
+    rm00 = (e0e0 + e1e1) * 2.0 - 1.0
+    rm01 = (e1e2 - e0e3) * 2.0
+    rm02 = (e1e3 + e0e2) * 2.0
+    rm10 = (e1e2 + e0e3) * 2.0
+    rm11 = (e0e0 + e2e2) * 2.0 - 1.0
+    rm12 = (e2e3 - e0e1) * 2.0
+    rm20 = (e1e3 - e0e2) * 2.0
+    rm21 = (e2e3 + e0e1) * 2.0
+    rm22 = (e0e0 + e3e3) * 2.0 - 1.0
+
+    # Rows of the rotation matrix (columns are axes).
+    return wp.mat33(
+        rm00,
+        rm01,
+        rm02,
+        rm10,
+        rm11,
+        rm12,
+        rm20,
+        rm21,
+        rm22,
+    )
+
+
+@wp.kernel
+def _mujoco_disc_terrain_collision_kernel(
+    # MuJoCo model (subset):
+    geom_type: wp.array(dtype=int),
+    geom_dataid: wp.array(dtype=int),
+    geom_friction: wp.array2d(dtype=wp.vec3),
+    hfield_size: wp.array(dtype=wp.vec4),
+    hfield_nrow: wp.array(dtype=int),
+    hfield_ncol: wp.array(dtype=int),
+    hfield_adr: wp.array(dtype=int),
+    hfield_data: wp.array(dtype=float),
+    # MuJoCo data (subset):
+    xipos: wp.array2d(dtype=wp.vec3),
+    xmat: wp.array2d(dtype=wp.mat33),
+    geom_xpos: wp.array2d(dtype=wp.vec3),
+    geom_xmat: wp.array2d(dtype=wp.mat33),
+    # Tire config:
+    wheel_body_ids: wp.array(dtype=int),
+    nwheels: int,
+    terrain_geom_id: int,
+    collision_type: int,
+    disc_radius: float,
+    width: float,
+    # Area-depth table (Chrono ConstructAreaDepthTable) for ENVELOPE:
+    area_xs: wp.array(dtype=float),
+    area_ys: wp.array(dtype=float),
+    area_n: int,
+    # Outputs (flat, length = nworld*nwheels):
+    in_contact_out: wp.array(dtype=int),
+    depth_out: wp.array(dtype=float),
+    mu_out: wp.array(dtype=float),
+    pos_out: wp.array(dtype=wp.vec3),
+    x_axis_out: wp.array(dtype=wp.vec3),
+    y_axis_out: wp.array(dtype=wp.vec3),
+    z_axis_out: wp.array(dtype=wp.vec3),
+):
+    # Chrono reference: chrono/src/chrono_vehicle/wheeled_vehicle/ChTire.cpp::DiscTerrainCollision*
+    tid = wp.tid()
+
+    worldid = tid // nwheels
+    wheel_idx = tid - worldid * nwheels
+    bodyid = wheel_body_ids[wheel_idx]
+
+    contact_pos = wp.vec3(0.0, 0.0, 0.0)
+    contact_x = wp.vec3(1.0, 0.0, 0.0)
+    contact_y = wp.vec3(0.0, 1.0, 0.0)
+    contact_z = wp.vec3(0.0, 0.0, 1.0)
+
+    in_contact = int(0)
+    depth = 0.0
+
+    disc_center = xipos[worldid, bodyid]
+    body_R = xmat[worldid, bodyid]
+    disc_normal = wp.vec3(body_R[0, 1], body_R[1, 1], body_R[2, 1])  # wheel axis (Chrono: Y)
+    disc_normal = _wp_normalize(disc_normal)
+
+    # Terrain friction (Chrono clamps after DiscTerrainCollision).
+    # Note: `DiscTerrainCollisionEnvelope` only sets friction if contact is found.
+    mu_terrain = geom_friction[worldid, terrain_geom_id][0]
+    mu = 0.0
+
+    world_vertical = wp.vec3(0.0, 0.0, 1.0)
+
+    if collision_type == 0:
+        # SINGLE_POINT
+        mu = mu_terrain
+        voffset = wp.vec3(0.0, 0.0, 2.0 * disc_radius)
+
+        wheel_forward = _wp_cross(disc_normal, world_vertical)
+        wheel_forward = _wp_normalize(wheel_forward)
+        wheel_bottom = disc_center + disc_radius * _wp_cross(disc_normal, wheel_forward)
+
+        hn = _wp_mujoco_terrain_height_normal(
+            wheel_bottom + voffset,
+            worldid,
+            terrain_geom_id,
+            geom_type,
+            geom_dataid,
+            geom_xpos,
+            geom_xmat,
+            hfield_size,
+            hfield_nrow,
+            hfield_ncol,
+            hfield_adr,
+            hfield_data,
+        )
+        hc = hn[0]
+        normal = wp.vec3(hn[1], hn[2], hn[3])
+
+        if _wp_height(disc_center) > hc:
+            hc_height = _wp_height(wheel_bottom)
+            depth = (hc - hc_height) * normal[2]
+
+            wheel_forward_normal = _wp_cross(disc_normal, normal)
+            sin_tilt2 = _wp_len2(wheel_forward_normal)
+            if sin_tilt2 >= 1e-3:
+                wheel_forward_normal = wheel_forward_normal * (1.0 / wp.sqrt(sin_tilt2))
+
+                depth = disc_radius - ((disc_radius - depth) * _wp_dot(wheel_forward, wheel_forward_normal))
+                if depth > 0.0:
+                    wheel_bottom = disc_center + (disc_radius - depth) * _wp_cross(disc_normal, wheel_forward_normal)
+
+                    longitudinal = _wp_cross(disc_normal, normal)
+                    longitudinal = _wp_normalize(longitudinal)
+                    lateral = _wp_cross(normal, longitudinal)
+
+                    contact_pos = wheel_bottom
+                    contact_x = longitudinal
+                    contact_y = lateral
+                    contact_z = normal
+                    in_contact = int(1)
+
+    elif collision_type == 1:
+        # FOUR_POINTS
+        mu = mu_terrain
+        dx = 0.1 * disc_radius
+        dy = 0.3 * width
+        voffset = wp.vec3(0.0, 0.0, 2.0 * disc_radius)
+
+        wheel_forward = _wp_cross(disc_normal, world_vertical)
+        wheel_forward = _wp_normalize(wheel_forward)
+        wheel_bottom = disc_center + disc_radius * _wp_cross(disc_normal, wheel_forward)
+
+        hn = _wp_mujoco_terrain_height_normal(
+            wheel_bottom + voffset,
+            worldid,
+            terrain_geom_id,
+            geom_type,
+            geom_dataid,
+            geom_xpos,
+            geom_xmat,
+            hfield_size,
+            hfield_nrow,
+            hfield_ncol,
+            hfield_adr,
+            hfield_data,
+        )
+        hc = hn[0]
+        normal = wp.vec3(hn[1], hn[2], hn[3])
+
+        if _wp_height(disc_center) > hc:
+            wheel_forward_normal = _wp_cross(disc_normal, normal)
+            sin_tilt2 = _wp_len2(wheel_forward_normal)
+            if sin_tilt2 >= 1e-3:
+                wheel_forward_normal = wheel_forward_normal * (1.0 / wp.sqrt(sin_tilt2))
+                wheel_bottom = disc_center + disc_radius * _wp_cross(disc_normal, wheel_forward_normal)
+
+                longitudinal = _wp_cross(disc_normal, normal)
+                longitudinal = _wp_normalize(longitudinal)
+                lateral = _wp_cross(normal, longitudinal)
+
+                # Project 4 points vertically onto the terrain.
+                ptQ1 = wheel_bottom + dx * longitudinal
+                hn1 = _wp_mujoco_terrain_height_normal(
+                    ptQ1 + voffset,
+                    worldid,
+                    terrain_geom_id,
+                    geom_type,
+                    geom_dataid,
+                    geom_xpos,
+                    geom_xmat,
+                    hfield_size,
+                    hfield_nrow,
+                    hfield_ncol,
+                    hfield_adr,
+                    hfield_data,
+                )
+                ptQ1 = wp.vec3(ptQ1[0], ptQ1[1], ptQ1[2] - (_wp_height(ptQ1) - hn1[0]))
+
+                ptQ2 = wheel_bottom - dx * longitudinal
+                hn2 = _wp_mujoco_terrain_height_normal(
+                    ptQ2 + voffset,
+                    worldid,
+                    terrain_geom_id,
+                    geom_type,
+                    geom_dataid,
+                    geom_xpos,
+                    geom_xmat,
+                    hfield_size,
+                    hfield_nrow,
+                    hfield_ncol,
+                    hfield_adr,
+                    hfield_data,
+                )
+                ptQ2 = wp.vec3(ptQ2[0], ptQ2[1], ptQ2[2] - (_wp_height(ptQ2) - hn2[0]))
+
+                ptQ3 = wheel_bottom + dy * lateral
+                hn3 = _wp_mujoco_terrain_height_normal(
+                    ptQ3 + voffset,
+                    worldid,
+                    terrain_geom_id,
+                    geom_type,
+                    geom_dataid,
+                    geom_xpos,
+                    geom_xmat,
+                    hfield_size,
+                    hfield_nrow,
+                    hfield_ncol,
+                    hfield_adr,
+                    hfield_data,
+                )
+                ptQ3 = wp.vec3(ptQ3[0], ptQ3[1], ptQ3[2] - (_wp_height(ptQ3) - hn3[0]))
+
+                ptQ4 = wheel_bottom - dy * lateral
+                hn4 = _wp_mujoco_terrain_height_normal(
+                    ptQ4 + voffset,
+                    worldid,
+                    terrain_geom_id,
+                    geom_type,
+                    geom_dataid,
+                    geom_xpos,
+                    geom_xmat,
+                    hfield_size,
+                    hfield_nrow,
+                    hfield_ncol,
+                    hfield_adr,
+                    hfield_data,
+                )
+                ptQ4 = wp.vec3(ptQ4[0], ptQ4[1], ptQ4[2] - (_wp_height(ptQ4) - hn4[0]))
+
+                rQ2Q1 = ptQ1 - ptQ2
+                rQ4Q3 = ptQ3 - ptQ4
+
+                terrain_normal = _wp_cross(rQ2Q1, rQ4Q3)
+                terrain_normal = _wp_normalize(terrain_normal)
+
+                wheel_bottom = 0.25 * (ptQ1 + ptQ2 + ptQ3 + ptQ4)
+                d = wheel_bottom - disc_center
+                da = wp.sqrt(_wp_len2(d))
+                if da < disc_radius:
+                    contact_pos = wheel_bottom
+                    contact_x = longitudinal
+                    contact_y = lateral
+                    contact_z = terrain_normal
+                    depth = disc_radius - da
+                    in_contact = int(1)
+
+    else:
+        # ENVELOPE
+        voffset = wp.vec3(0.0, 0.0, disc_radius)
+
+        hn = _wp_mujoco_terrain_height_normal(
+            disc_center + voffset,
+            worldid,
+            terrain_geom_id,
+            geom_type,
+            geom_dataid,
+            geom_xpos,
+            geom_xmat,
+            hfield_size,
+            hfield_nrow,
+            hfield_ncol,
+            hfield_adr,
+            hfield_data,
+        )
+        normal = wp.vec3(hn[1], hn[2], hn[3])
+        longitudinal = _wp_cross(disc_normal, normal)
+        longitudinal = _wp_normalize(longitudinal)
+
+        x_step = 2.0 * disc_radius / 180.0
+        A = float(0.0)
+        i = float(1.0)
+        while i < 180.0:
+            x = -disc_radius + x_step * i
+            p_test = disc_center + x * longitudinal
+            hnq = _wp_mujoco_terrain_height_normal(
+                p_test + voffset,
+                worldid,
+                terrain_geom_id,
+                geom_type,
+                geom_dataid,
+                geom_xpos,
+                geom_xmat,
+                hfield_size,
+                hfield_nrow,
+                hfield_ncol,
+                hfield_adr,
+                hfield_data,
+            )
+            q = hnq[0]
+            a = _wp_height(p_test) - wp.sqrt(disc_radius * disc_radius - x * x)
+            if q > a:
+                A += q - a
+            i = i + 1.0
+        A = A * x_step
+
+        if A != 0.0:
+            depth = _wp_interp_get_val(A, area_xs, area_ys, area_n)
+
+            dir1 = _wp_cross(disc_normal, normal)
+            sin_tilt2 = _wp_len2(dir1)
+            if sin_tilt2 >= 1e-3:
+                dir1_unit = dir1 * (1.0 / wp.sqrt(sin_tilt2))
+                ptD = disc_center + (disc_radius - depth) * _wp_cross(disc_normal, dir1_unit)
+
+                hn2 = _wp_mujoco_terrain_height_normal(
+                    ptD + 2.0 * voffset,
+                    worldid,
+                    terrain_geom_id,
+                    geom_type,
+                    geom_dataid,
+                    geom_xpos,
+                    geom_xmat,
+                    hfield_size,
+                    hfield_nrow,
+                    hfield_ncol,
+                    hfield_adr,
+                    hfield_data,
+                )
+                normal = wp.vec3(hn2[1], hn2[2], hn2[3])
+                longitudinal = _wp_cross(disc_normal, normal)
+                longitudinal = _wp_normalize(longitudinal)
+                lateral = _wp_cross(normal, longitudinal)
+
+                contact_pos = ptD
+                contact_x = longitudinal
+                contact_y = lateral
+                contact_z = normal
+                in_contact = int(1)
+                mu = mu_terrain
+
+    # Apply Chrono's quaternion round-trip to match `ChCoordsys::rot` behavior.
+    if in_contact != 0:
+        R_rt = _wp_axes_via_chrono_quat_roundtrip(contact_x, contact_y, contact_z)
+        contact_x = wp.vec3(R_rt[0, 0], R_rt[1, 0], R_rt[2, 0])
+        contact_y = wp.vec3(R_rt[0, 1], R_rt[1, 1], R_rt[2, 1])
+        contact_z = wp.vec3(R_rt[0, 2], R_rt[1, 2], R_rt[2, 2])
+
+    in_contact_out[tid] = in_contact
+    depth_out[tid] = depth
+    mu_out[tid] = mu
+    pos_out[tid] = contact_pos
+    x_axis_out[tid] = contact_x
+    y_axis_out[tid] = contact_y
+    z_axis_out[tid] = contact_z
+
+
+@wp.func
+def _wp_hfield_height_normal_world_aligned(
+    loc: wp.vec3,
+    pos_x: float,
+    pos_y: float,
+    pos_z: float,
+    size_x: float,
+    size_y: float,
+    size_z_top: float,
+    nrow: int,
+    ncol: int,
+    hfield_data: wp.array(dtype=float),
+) -> wp.vec4:
+    hn = _wp_hfield_height_normal_local(
+        loc[0] - pos_x,
+        loc[1] - pos_y,
+        size_x,
+        size_y,
+        size_z_top,
+        nrow,
+        ncol,
+        int(0),
+        hfield_data,
+    )
+    return wp.vec4(pos_z + hn[0], hn[1], hn[2], hn[3])
+
+
+@wp.kernel
+def _disc_collision_1pt_hfield_kernel(
+    disc_center_in: wp.array(dtype=wp.vec3),
+    disc_normal_in: wp.array(dtype=wp.vec3),
+    disc_radius: float,
+    terrain_mu: float,
+    hfield_pos_x: float,
+    hfield_pos_y: float,
+    hfield_pos_z: float,
+    hfield_size_x: float,
+    hfield_size_y: float,
+    hfield_size_z_top: float,
+    hfield_nrow: int,
+    hfield_ncol: int,
+    hfield_data: wp.array(dtype=float),
+    in_contact_out: wp.array(dtype=int),
+    depth_out: wp.array(dtype=float),
+    mu_out: wp.array(dtype=float),
+    pos_out: wp.array(dtype=wp.vec3),
+    x_axis_out: wp.array(dtype=wp.vec3),
+    y_axis_out: wp.array(dtype=wp.vec3),
+    z_axis_out: wp.array(dtype=wp.vec3),
+):
+    # Chrono reference: chrono/src/chrono_vehicle/wheeled_vehicle/ChTire.cpp::DiscTerrainCollision1pt
+    tid = wp.tid()
+
+    contact_pos = wp.vec3(0.0, 0.0, 0.0)
+    contact_x = wp.vec3(1.0, 0.0, 0.0)
+    contact_y = wp.vec3(0.0, 1.0, 0.0)
+    contact_z = wp.vec3(0.0, 0.0, 1.0)
+
+    in_contact = 0
+    depth = 0.0
+    mu = terrain_mu
+
+    disc_center = disc_center_in[tid]
+    disc_normal = _wp_normalize(disc_normal_in[tid])
+
+    voffset = wp.vec3(0.0, 0.0, 2.0 * disc_radius)
+
+    wheel_forward = _wp_cross(disc_normal, wp.vec3(0.0, 0.0, 1.0))
+    wheel_forward = _wp_normalize(wheel_forward)
+    wheel_bottom = disc_center + disc_radius * _wp_cross(disc_normal, wheel_forward)
+
+    hn = _wp_hfield_height_normal_world_aligned(
+        wheel_bottom + voffset,
+        hfield_pos_x,
+        hfield_pos_y,
+        hfield_pos_z,
+        hfield_size_x,
+        hfield_size_y,
+        hfield_size_z_top,
+        hfield_nrow,
+        hfield_ncol,
+        hfield_data,
+    )
+    hc = hn[0]
+    normal = wp.vec3(hn[1], hn[2], hn[3])
+
+    disc_height = _wp_height(disc_center)
+    if disc_height > hc:
+        hc_height = _wp_height(wheel_bottom)
+        depth = (hc - hc_height) * normal[2]
+
+        wheel_forward_normal = _wp_cross(disc_normal, normal)
+        sin_tilt2 = _wp_len2(wheel_forward_normal)
+        if sin_tilt2 >= 1e-3:
+            wheel_forward_normal = wheel_forward_normal * (1.0 / wp.sqrt(sin_tilt2))
+
+            depth = disc_radius - ((disc_radius - depth) * _wp_dot(wheel_forward, wheel_forward_normal))
+            if depth > 0.0:
+                wheel_bottom = disc_center + (disc_radius - depth) * _wp_cross(disc_normal, wheel_forward_normal)
+
+                longitudinal = _wp_cross(disc_normal, normal)
+                longitudinal = _wp_normalize(longitudinal)
+                lateral = _wp_cross(normal, longitudinal)
+
+                contact_pos = wheel_bottom
+                contact_x = longitudinal
+                contact_y = lateral
+                contact_z = normal
+                in_contact = 1
+
+    if in_contact != 0:
+        R_rt = _wp_axes_via_chrono_quat_roundtrip(contact_x, contact_y, contact_z)
+        contact_x = wp.vec3(R_rt[0, 0], R_rt[1, 0], R_rt[2, 0])
+        contact_y = wp.vec3(R_rt[0, 1], R_rt[1, 1], R_rt[2, 1])
+        contact_z = wp.vec3(R_rt[0, 2], R_rt[1, 2], R_rt[2, 2])
+
+    in_contact_out[tid] = in_contact
+    depth_out[tid] = depth
+    mu_out[tid] = mu
+    pos_out[tid] = contact_pos
+    x_axis_out[tid] = contact_x
+    y_axis_out[tid] = contact_y
+    z_axis_out[tid] = contact_z
+
+
+@wp.kernel
+def _disc_collision_4pt_hfield_kernel(
+    disc_center_in: wp.array(dtype=wp.vec3),
+    disc_normal_in: wp.array(dtype=wp.vec3),
+    disc_radius: float,
+    width: float,
+    terrain_mu: float,
+    hfield_pos_x: float,
+    hfield_pos_y: float,
+    hfield_pos_z: float,
+    hfield_size_x: float,
+    hfield_size_y: float,
+    hfield_size_z_top: float,
+    hfield_nrow: int,
+    hfield_ncol: int,
+    hfield_data: wp.array(dtype=float),
+    in_contact_out: wp.array(dtype=int),
+    depth_out: wp.array(dtype=float),
+    mu_out: wp.array(dtype=float),
+    pos_out: wp.array(dtype=wp.vec3),
+    x_axis_out: wp.array(dtype=wp.vec3),
+    y_axis_out: wp.array(dtype=wp.vec3),
+    z_axis_out: wp.array(dtype=wp.vec3),
+):
+    # Chrono reference: chrono/src/chrono_vehicle/wheeled_vehicle/ChTire.cpp::DiscTerrainCollision4pt
+    tid = wp.tid()
+
+    contact_pos = wp.vec3(0.0, 0.0, 0.0)
+    contact_x = wp.vec3(1.0, 0.0, 0.0)
+    contact_y = wp.vec3(0.0, 1.0, 0.0)
+    contact_z = wp.vec3(0.0, 0.0, 1.0)
+
+    in_contact = 0
+    depth = 0.0
+    mu = terrain_mu
+
+    disc_center = disc_center_in[tid]
+    disc_normal = _wp_normalize(disc_normal_in[tid])
+
+    dx = 0.1 * disc_radius
+    dy = 0.3 * width
+
+    voffset = wp.vec3(0.0, 0.0, 2.0 * disc_radius)
+
+    wheel_forward = _wp_cross(disc_normal, wp.vec3(0.0, 0.0, 1.0))
+    wheel_forward = _wp_normalize(wheel_forward)
+    wheel_bottom = disc_center + disc_radius * _wp_cross(disc_normal, wheel_forward)
+
+    hn = _wp_hfield_height_normal_world_aligned(
+        wheel_bottom + voffset,
+        hfield_pos_x,
+        hfield_pos_y,
+        hfield_pos_z,
+        hfield_size_x,
+        hfield_size_y,
+        hfield_size_z_top,
+        hfield_nrow,
+        hfield_ncol,
+        hfield_data,
+    )
+    hc = hn[0]
+    normal = wp.vec3(hn[1], hn[2], hn[3])
+
+    disc_height = _wp_height(disc_center)
+    if disc_height > hc:
+        wheel_forward_normal = _wp_cross(disc_normal, normal)
+        sin_tilt2 = _wp_len2(wheel_forward_normal)
+        if sin_tilt2 >= 1e-3:
+            wheel_forward_normal = wheel_forward_normal * (1.0 / wp.sqrt(sin_tilt2))
+            wheel_bottom = disc_center + disc_radius * _wp_cross(disc_normal, wheel_forward_normal)
+
+            longitudinal = _wp_cross(disc_normal, normal)
+            longitudinal = _wp_normalize(longitudinal)
+            lateral = _wp_cross(normal, longitudinal)
+
+            ptQ1 = wheel_bottom + dx * longitudinal
+            hQ1 = _wp_hfield_height_normal_world_aligned(
+                ptQ1 + voffset,
+                hfield_pos_x,
+                hfield_pos_y,
+                hfield_pos_z,
+                hfield_size_x,
+                hfield_size_y,
+                hfield_size_z_top,
+                hfield_nrow,
+                hfield_ncol,
+                hfield_data,
+            )[0]
+            ptQ1 = wp.vec3(ptQ1[0], ptQ1[1], ptQ1[2] - (_wp_height(ptQ1) - hQ1))
+
+            ptQ2 = wheel_bottom - dx * longitudinal
+            hQ2 = _wp_hfield_height_normal_world_aligned(
+                ptQ2 + voffset,
+                hfield_pos_x,
+                hfield_pos_y,
+                hfield_pos_z,
+                hfield_size_x,
+                hfield_size_y,
+                hfield_size_z_top,
+                hfield_nrow,
+                hfield_ncol,
+                hfield_data,
+            )[0]
+            ptQ2 = wp.vec3(ptQ2[0], ptQ2[1], ptQ2[2] - (_wp_height(ptQ2) - hQ2))
+
+            ptQ3 = wheel_bottom + dy * lateral
+            hQ3 = _wp_hfield_height_normal_world_aligned(
+                ptQ3 + voffset,
+                hfield_pos_x,
+                hfield_pos_y,
+                hfield_pos_z,
+                hfield_size_x,
+                hfield_size_y,
+                hfield_size_z_top,
+                hfield_nrow,
+                hfield_ncol,
+                hfield_data,
+            )[0]
+            ptQ3 = wp.vec3(ptQ3[0], ptQ3[1], ptQ3[2] - (_wp_height(ptQ3) - hQ3))
+
+            ptQ4 = wheel_bottom - dy * lateral
+            hQ4 = _wp_hfield_height_normal_world_aligned(
+                ptQ4 + voffset,
+                hfield_pos_x,
+                hfield_pos_y,
+                hfield_pos_z,
+                hfield_size_x,
+                hfield_size_y,
+                hfield_size_z_top,
+                hfield_nrow,
+                hfield_ncol,
+                hfield_data,
+            )[0]
+            ptQ4 = wp.vec3(ptQ4[0], ptQ4[1], ptQ4[2] - (_wp_height(ptQ4) - hQ4))
+
+            rQ2Q1 = ptQ1 - ptQ2
+            rQ4Q3 = ptQ3 - ptQ4
+
+            terrain_normal = _wp_cross(rQ2Q1, rQ4Q3)
+            terrain_normal = _wp_normalize(terrain_normal)
+
+            wheel_bottom = 0.25 * (ptQ1 + ptQ2 + ptQ3 + ptQ4)
+            d = wheel_bottom - disc_center
+            da = wp.sqrt(_wp_len2(d))
+            if da < disc_radius:
+                contact_pos = wheel_bottom
+                contact_x = longitudinal
+                contact_y = lateral
+                contact_z = terrain_normal
+                depth = disc_radius - da
+                in_contact = 1
+
+    if in_contact != 0:
+        R_rt = _wp_axes_via_chrono_quat_roundtrip(contact_x, contact_y, contact_z)
+        contact_x = wp.vec3(R_rt[0, 0], R_rt[1, 0], R_rt[2, 0])
+        contact_y = wp.vec3(R_rt[0, 1], R_rt[1, 1], R_rt[2, 1])
+        contact_z = wp.vec3(R_rt[0, 2], R_rt[1, 2], R_rt[2, 2])
+
+    in_contact_out[tid] = in_contact
+    depth_out[tid] = depth
+    mu_out[tid] = mu
+    pos_out[tid] = contact_pos
+    x_axis_out[tid] = contact_x
+    y_axis_out[tid] = contact_y
+    z_axis_out[tid] = contact_z
+
+
+@wp.kernel
+def _disc_collision_envelope_hfield_kernel(
+    disc_center_in: wp.array(dtype=wp.vec3),
+    disc_normal_in: wp.array(dtype=wp.vec3),
+    disc_radius: float,
+    width: float,
+    area_xs: wp.array(dtype=float),
+    area_ys: wp.array(dtype=float),
+    area_n: int,
+    terrain_mu: float,
+    hfield_pos_x: float,
+    hfield_pos_y: float,
+    hfield_pos_z: float,
+    hfield_size_x: float,
+    hfield_size_y: float,
+    hfield_size_z_top: float,
+    hfield_nrow: int,
+    hfield_ncol: int,
+    hfield_data: wp.array(dtype=float),
+    in_contact_out: wp.array(dtype=int),
+    depth_out: wp.array(dtype=float),
+    mu_out: wp.array(dtype=float),
+    pos_out: wp.array(dtype=wp.vec3),
+    x_axis_out: wp.array(dtype=wp.vec3),
+    y_axis_out: wp.array(dtype=wp.vec3),
+    z_axis_out: wp.array(dtype=wp.vec3),
+):
+    # Chrono reference: chrono/src/chrono_vehicle/wheeled_vehicle/ChTire.cpp::DiscTerrainCollisionEnvelope
+    (void_width,) = (width,)
+    tid = wp.tid()
+
+    contact_pos = wp.vec3(0.0, 0.0, 0.0)
+    contact_x = wp.vec3(1.0, 0.0, 0.0)
+    contact_y = wp.vec3(0.0, 1.0, 0.0)
+    contact_z = wp.vec3(0.0, 0.0, 1.0)
+
+    in_contact = 0
+    depth = 0.0
+    mu = 0.0
+
+    disc_center = disc_center_in[tid]
+    disc_normal = _wp_normalize(disc_normal_in[tid])
+
+    voffset = wp.vec3(0.0, 0.0, disc_radius)
+
+    hn0 = _wp_hfield_height_normal_world_aligned(
+        disc_center + voffset,
+        hfield_pos_x,
+        hfield_pos_y,
+        hfield_pos_z,
+        hfield_size_x,
+        hfield_size_y,
+        hfield_size_z_top,
+        hfield_nrow,
+        hfield_ncol,
+        hfield_data,
+    )
+    normal = wp.vec3(hn0[1], hn0[2], hn0[3])
+    longitudinal = _wp_cross(disc_normal, normal)
+    longitudinal = _wp_normalize(longitudinal)
+
+    x_step = 2.0 * disc_radius / 180.0
+    A = float(0.0)
+    i = float(1.0)
+    while i < 180.0:
+        x = -disc_radius + x_step * i
+        p_test = disc_center + x * longitudinal
+        q = _wp_hfield_height_normal_world_aligned(
+            p_test + voffset,
+            hfield_pos_x,
+            hfield_pos_y,
+            hfield_pos_z,
+            hfield_size_x,
+            hfield_size_y,
+            hfield_size_z_top,
+            hfield_nrow,
+            hfield_ncol,
+            hfield_data,
+        )[0]
+        a = _wp_height(p_test) - wp.sqrt(disc_radius * disc_radius - x * x)
+        if q > a:
+            A += q - a
+        i = i + 1.0
+    A = A * x_step
+
+    if A != 0.0:
+        depth = _wp_interp_get_val(A, area_xs, area_ys, area_n)
+
+        dir1 = _wp_cross(disc_normal, normal)
+        sin_tilt2 = _wp_len2(dir1)
+        if sin_tilt2 >= 1e-3:
+            dir1_unit = dir1 * (1.0 / wp.sqrt(sin_tilt2))
+            ptD = disc_center + (disc_radius - depth) * _wp_cross(disc_normal, dir1_unit)
+
+            hn2 = _wp_hfield_height_normal_world_aligned(
+                ptD + 2.0 * voffset,
+                hfield_pos_x,
+                hfield_pos_y,
+                hfield_pos_z,
+                hfield_size_x,
+                hfield_size_y,
+                hfield_size_z_top,
+                hfield_nrow,
+                hfield_ncol,
+                hfield_data,
+            )
+            normal = wp.vec3(hn2[1], hn2[2], hn2[3])
+            longitudinal = _wp_cross(disc_normal, normal)
+            longitudinal = _wp_normalize(longitudinal)
+            lateral = _wp_cross(normal, longitudinal)
+
+            contact_pos = ptD
+            contact_x = longitudinal
+            contact_y = lateral
+            contact_z = normal
+
+            mu = terrain_mu
+            in_contact = 1
+
+    if in_contact != 0:
+        R_rt = _wp_axes_via_chrono_quat_roundtrip(contact_x, contact_y, contact_z)
+        contact_x = wp.vec3(R_rt[0, 0], R_rt[1, 0], R_rt[2, 0])
+        contact_y = wp.vec3(R_rt[0, 1], R_rt[1, 1], R_rt[2, 1])
+        contact_z = wp.vec3(R_rt[0, 2], R_rt[1, 2], R_rt[2, 2])
+
+    in_contact_out[tid] = in_contact
+    depth_out[tid] = depth
+    mu_out[tid] = mu
+    pos_out[tid] = contact_pos
+    x_axis_out[tid] = contact_x
+    y_axis_out[tid] = contact_y
+    z_axis_out[tid] = contact_z
 
 
 @wp.func
@@ -1176,6 +2170,129 @@ def run_disc_terrain_collision_batched(
                 float(terrain.base),
                 float(terrain.amp),
                 float(terrain.freq),
+            ],
+            outputs=[in_contact_out, depth_out, mu_out, pos_out, x_axis_out, y_axis_out, z_axis_out],
+            device=device,
+        )
+    else:
+        raise ValueError(f"Unsupported collision method: {method}")
+
+    return {
+        "in_contact": [bool(x) for x in in_contact_out.numpy().tolist()],
+        "depth": depth_out.numpy().tolist(),
+        "mu": mu_out.numpy().tolist(),
+        "pos": pos_out.numpy().tolist(),
+        "x_axis": x_axis_out.numpy().tolist(),
+        "y_axis": y_axis_out.numpy().tolist(),
+        "z_axis": z_axis_out.numpy().tolist(),
+    }
+
+
+def run_disc_terrain_collision_hfield_batched(
+    method: CollisionType,
+    terrain: HFieldTerrain,
+    disc_center: Sequence[Vec3],
+    disc_normal: Sequence[Vec3],
+    disc_radius: float,
+    width: float,
+    *,
+    device: str | wp.context.Device = "cpu",
+) -> dict[str, list[object]]:
+    """Warp-batched disc-terrain collision for axis-aligned heightfields."""
+    if len(disc_center) != len(disc_normal):
+        raise ValueError("disc_center and disc_normal must have the same length.")
+
+    wp.init()
+
+    n = len(disc_center)
+    disc_center_wp = wp.array(disc_center, dtype=wp.vec3, device=device)
+    disc_normal_wp = wp.array(disc_normal, dtype=wp.vec3, device=device)
+
+    in_contact_out = wp.empty(n, dtype=int, device=device)
+    depth_out = wp.empty(n, dtype=float, device=device)
+    mu_out = wp.empty(n, dtype=float, device=device)
+    pos_out = wp.empty(n, dtype=wp.vec3, device=device)
+    x_axis_out = wp.empty(n, dtype=wp.vec3, device=device)
+    y_axis_out = wp.empty(n, dtype=wp.vec3, device=device)
+    z_axis_out = wp.empty(n, dtype=wp.vec3, device=device)
+
+    size_x, size_y, size_z_top, _size_z_bottom = terrain.size
+    pos_x, pos_y, pos_z = (float(terrain.pos[0]), float(terrain.pos[1]), float(terrain.pos[2]))
+    hdata = wp.array([float(x) for x in terrain.data], dtype=float, device=device)
+
+    if method == CollisionType.SINGLE_POINT:
+        wp.launch(
+            _disc_collision_1pt_hfield_kernel,
+            dim=n,
+            inputs=[
+                disc_center_wp,
+                disc_normal_wp,
+                float(disc_radius),
+                float(terrain.mu),
+                pos_x,
+                pos_y,
+                pos_z,
+                float(size_x),
+                float(size_y),
+                float(size_z_top),
+                int(terrain.nrow),
+                int(terrain.ncol),
+                hdata,
+            ],
+            outputs=[in_contact_out, depth_out, mu_out, pos_out, x_axis_out, y_axis_out, z_axis_out],
+            device=device,
+        )
+    elif method == CollisionType.FOUR_POINTS:
+        wp.launch(
+            _disc_collision_4pt_hfield_kernel,
+            dim=n,
+            inputs=[
+                disc_center_wp,
+                disc_normal_wp,
+                float(disc_radius),
+                float(width),
+                float(terrain.mu),
+                pos_x,
+                pos_y,
+                pos_z,
+                float(size_x),
+                float(size_y),
+                float(size_z_top),
+                int(terrain.nrow),
+                int(terrain.ncol),
+                hdata,
+            ],
+            outputs=[in_contact_out, depth_out, mu_out, pos_out, x_axis_out, y_axis_out, z_axis_out],
+            device=device,
+        )
+    elif method == CollisionType.ENVELOPE:
+        area_dep = ChFunctionInterp()
+        ConstructAreaDepthTable(float(disc_radius), area_dep)
+        pairs = area_dep.table
+        area_xs = wp.array([p[0] for p in pairs], dtype=float, device=device)
+        area_ys = wp.array([p[1] for p in pairs], dtype=float, device=device)
+
+        wp.launch(
+            _disc_collision_envelope_hfield_kernel,
+            dim=n,
+            inputs=[
+                disc_center_wp,
+                disc_normal_wp,
+                float(disc_radius),
+                float(width),
+                area_xs,
+                area_ys,
+                int(len(pairs)),
+                float(terrain.mu),
+                pos_x,
+                pos_y,
+                pos_z,
+                float(size_x),
+                float(size_y),
+                float(size_z_top),
+                int(terrain.nrow),
+                int(terrain.ncol),
+                hdata,
             ],
             outputs=[in_contact_out, depth_out, mu_out, pos_out, x_axis_out, y_axis_out, z_axis_out],
             device=device,

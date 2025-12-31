@@ -496,6 +496,23 @@ class SolverMuJoCo(SolverBase):
                     device=self.model.device,
                 )
 
+            # Install the MuJoCo-Warp control callback once (global `mujoco_warp.mjcb_control`).
+            #
+            # This callback is evaluated during `forward()` and therefore also for each RK4 stage.
+            # We intentionally do not reassign it each step for performance and to avoid hiding failures.
+            _, mujoco_warp = self.import_mujoco()
+            prev_cb = mujoco_warp.mjcb_control
+
+            def _cb(m, d):  # noqa: ANN001
+                if prev_cb is not None:
+                    prev_cb(m, d)
+                for mod in self._tire_modules:
+                    apply = getattr(mod, "apply", None)
+                    if apply is not None:
+                        apply(m, d)
+
+            mujoco_warp.mjcb_control = _cb
+
     @event_scope
     def mujoco_warp_step(self):
         self._mujoco_warp.step(self.mjw_model, self.mjw_data)
@@ -517,28 +534,11 @@ class SolverMuJoCo(SolverBase):
                 self.update_mjc_data(self.mjw_data, self.model, state_in)
             self.mjw_model.opt.timestep.fill_(dt)
             with wp.ScopedDevice(self.model.device):
-                import mujoco_warp  # noqa: PLC0415
-
-                prev_cb = mujoco_warp.mjcb_control
-                if self._tire_modules:
-                    # Chain any existing callback.
-                    def _cb(m, d):  # noqa: ANN001
-                        if prev_cb is not None:
-                            prev_cb(m, d)
-                        for mod in self._tire_modules:
-                            apply = getattr(mod, "apply", None)
-                            if apply is not None:
-                                apply(m, d)
-
-                    mujoco_warp.mjcb_control = _cb
-                try:
-                    if self.mjw_model.opt.run_collision_detection:
-                        self.mujoco_warp_step()
-                    else:
-                        self.convert_contacts_to_mjwarp(self.model, state_in, contacts)
-                        self.mujoco_warp_step()
-                finally:
-                    mujoco_warp.mjcb_control = prev_cb
+                if self.mjw_model.opt.run_collision_detection:
+                    self.mujoco_warp_step()
+                else:
+                    self.convert_contacts_to_mjwarp(self.model, state_in, contacts)
+                    self.mujoco_warp_step()
 
             self.update_newton_state(self.model, state_out, self.mjw_data)
         self._step += 1

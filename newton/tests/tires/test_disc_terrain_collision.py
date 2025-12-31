@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import math
 import unittest
 
 from newton._src.vehicle.tires.disc_terrain_collision import (
@@ -23,10 +24,12 @@ from newton._src.vehicle.tires.disc_terrain_collision import (
     CollisionType,
     ConstructAreaDepthTable,
     DiscTerrainCollision,
+    HFieldTerrain,
     TerrainType,
     _axes_via_chrono_quat_roundtrip,
     _v_normalize,
     run_disc_terrain_collision_batched,
+    run_disc_terrain_collision_hfield_batched,
 )
 from newton.tests.tires.chrono_gt import run_chrono_gt
 
@@ -52,6 +55,20 @@ def _terrain_request(t: AnalyticTerrain) -> dict[str, object]:
     if t.type == TerrainType.SINUSOID:
         return {"type": "sinusoid", "base": float(t.base), "amp": float(t.amp), "freq": float(t.freq), "mu": float(t.mu)}
     raise ValueError(f"Unsupported terrain type: {t.type}")
+
+
+def _hfield_request(t: HFieldTerrain) -> dict[str, object]:
+    req: dict[str, object] = {
+        "type": "hfield",
+        "mu": float(t.mu),
+        "size": [float(x) for x in t.size],
+        "nrow": int(t.nrow),
+        "ncol": int(t.ncol),
+        "data": [float(x) for x in t.data],
+    }
+    if t.pos != (0.0, 0.0, 0.0):
+        req["pos"] = [float(x) for x in t.pos]
+    return req
 
 
 def _method_str(method: CollisionType) -> str:
@@ -329,5 +346,73 @@ class TestDiscTerrainCollisionAgainstChrono(unittest.TestCase):
                                     rtol=1e-6,
                                     atol=1e-6,
                                 )
+
+    def test_warp_batched_hfield_matches_chrono_for_nworld_2(self):
+        nrow, ncol = 17, 17
+        size_x, size_y, size_z_top, size_z_bottom = (1.0, 1.0, 0.2, 0.0)
+
+        data: list[float] = []
+        for r in range(nrow):
+            y = -size_y + 2.0 * size_y * r / float(nrow - 1)
+            for c in range(ncol):
+                x = -size_x + 2.0 * size_x * c / float(ncol - 1)
+                raw = math.sin(2.0 * x) * math.sin(2.0 * y)  # [-1, 1]
+                data.append(0.5 * (raw + 1.0))  # normalize to [0, 1]
+
+        terrain = HFieldTerrain(
+            size=(size_x, size_y, size_z_top, size_z_bottom),
+            nrow=nrow,
+            ncol=ncol,
+            data=data,
+            pos=(0.0, 0.0, 0.0),
+            mu=0.7,
+        )
+
+        disc_radius = 0.5
+        width = 0.2
+
+        # Choose disc heights relative to the terrain height at the origin.
+        h0 = terrain.GetHeight((0.0, 0.0, 0.0))
+        disc_center = [(0.0, 0.0, disc_radius + h0 - 0.05), (0.0, 0.0, disc_radius + h0 + 0.05)]
+        disc_normal = [tuple(_v_normalize((0.0, 1.0, 0.1))), tuple(_v_normalize((0.0, 1.0, -0.1)))]
+
+        for method in [CollisionType.SINGLE_POINT, CollisionType.FOUR_POINTS, CollisionType.ENVELOPE]:
+            with self.subTest(method=method):
+                batched = run_disc_terrain_collision_hfield_batched(
+                    method,
+                    terrain,
+                    disc_center,
+                    disc_normal,
+                    disc_radius,
+                    width,
+                    device="cpu",
+                )
+
+                for i in range(2):
+                    gt = run_chrono_gt(
+                        {
+                            "cmd": "disc_terrain_collision",
+                            "collision_type": _method_str(method),
+                            "disc_center": list(disc_center[i]),
+                            "disc_normal": list(disc_normal[i]),
+                            "disc_radius": disc_radius,
+                            "width": width,
+                            "terrain": _hfield_request(terrain),
+                        }
+                    )
+                    self.assertTrue(gt["ok"])
+
+                    self.assertEqual(batched["in_contact"][i], gt["in_contact"])
+                    _assert_close(self, float(batched["depth"][i]), float(gt["depth"]), rtol=1e-6, atol=1e-6)
+                    _assert_close(self, float(batched["mu"][i]), float(gt["mu"]), rtol=1e-6, atol=1e-6)
+                    for k in ["pos", "x_axis", "y_axis", "z_axis"]:
+                        for j in range(3):
+                            _assert_close(
+                                self,
+                                float(batched[k][i][j]),
+                                float(gt["contact"][k][j]),
+                                rtol=1e-6,
+                                atol=1e-6,
+                            )
 if __name__ == "__main__":
     unittest.main()
