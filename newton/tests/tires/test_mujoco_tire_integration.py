@@ -277,10 +277,10 @@ class TestMujocoWarpFialaTireIntegration(unittest.TestCase):
                     act_f = tuple(float(x) for x in xfrc[worldid, wheel_id, 0:3])
                     act_m = tuple(float(x) for x in xfrc[worldid, wheel_id, 3:6])
 
-                    if worldid == 0:
+                    if worldid == 0: # Make sure the contact scenario actually leads to contacts
                         self.assertGreater(exp_f[2], 0.0)
                         self.assertGreater(act_f[2], 0.0)
-                    else:
+                    else: # no contact scenario should lead to zero contact forces
                         self.assertEqual(exp_f, (0.0, 0.0, 0.0))
                         self.assertEqual(exp_m, (0.0, 0.0, 0.0))
                         self.assertEqual(act_f, (0.0, 0.0, 0.0))
@@ -323,7 +323,7 @@ class TestMujocoWarpFialaTireIntegration(unittest.TestCase):
 
         mjm = mujoco.MjModel.from_xml_string(xml)
         mjd = mujoco.MjData(mjm)
-        mjd.qvel[0:6] = [1.0, 0.0, 0.0, 0.0, 2.0, 0.0]
+        mjd.qvel[0:6] = [1.0, 0.0, 0.0, 0.0, 2.0, 0.0] 
 
         m = mujoco_warp.put_model(mjm)
         d = mujoco_warp.put_data(mjm, mjd, nworld=2)

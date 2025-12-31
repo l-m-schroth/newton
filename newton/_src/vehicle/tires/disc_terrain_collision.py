@@ -460,7 +460,6 @@ class AnalyticTerrain:
         return _v_normalize((-dfdx, -dfdy, 1.0))
 
     def GetCoefficientFriction(self, loc: Vec3) -> float:
-        (void_loc,) = (loc,)
         return float(self.mu)
 
     def GetProperties(self, loc: Vec3) -> tuple[float, Vec3, float]:
@@ -496,7 +495,8 @@ class HFieldTerrain:
             raise ValueError("HFieldTerrain: data length must match nrow*ncol")
 
     def GetHeight(self, loc: Vec3) -> float:
-        # Chrono reference: newton/newton/tests/tires/chrono_gt/newton_chrono_gt.cpp::HFieldTerrain::GetHeight
+        # MuJoCo reference: mujoco/src/engine/engine_collision_convex.c::mjc_ConvexHField (grid layout)
+        # MuJoCo reference: mujoco/src/engine/engine_ray.c::mj_rayHfieldNormal (triangulation)
         if self.nrow < 2 or self.ncol < 2 or len(self.data) == 0:
             return float(self.pos[2])
 
@@ -540,7 +540,7 @@ class HFieldTerrain:
         return float(self.pos[2] + z)
 
     def GetNormal(self, loc: Vec3) -> Vec3:
-        # Chrono reference: newton/newton/tests/tires/chrono_gt/newton_chrono_gt.cpp::HFieldTerrain::GetNormal
+        # MuJoCo reference: mujoco/src/engine/engine_ray.c::mj_rayHfieldNormal (triangulation)
         if self.nrow < 2 or self.ncol < 2 or len(self.data) == 0:
             return (0.0, 0.0, 1.0)
 
@@ -835,7 +835,7 @@ def _wp_mujoco_terrain_height_normal(
         n_world = _wp_normalize(ax * n_local[0] + ay * n_local[1] + az * n_local[2])
         return wp.vec4(h_world, n_world[0], n_world[1], n_world[2])
 
-    # Unsupported terrain type: return NaNs (caller should validate supported types on the host).
+    # Unsupported terrain type: return NaNs (caller should validate supported types on the host, directly throwing errors on device not possible).
     return wp.vec4(wp.nan, wp.nan, wp.nan, wp.nan)
 
 
