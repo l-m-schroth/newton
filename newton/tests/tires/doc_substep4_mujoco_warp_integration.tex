@@ -1,0 +1,226 @@
+% Substep 4 documentation (Newton / MuJoCo-Warp integration)
+%
+% This file documents the implementation work done in substep 4 of the tire-model
+% porting plan: integrating the previously validated tire math (substep 2) and
+% disc-terrain collision (substep 3) into Newton + MuJoCo-Warp via mjcb_control.
+%
+\section{Substep 4: Newton / MuJoCo-Warp Integration (Chrono-like Tires)}
+\label{sec:substep4-mujoco-integration}
+
+\subsection{Goal}
+Integrate the Chrono-like tire pipeline into the Newton MuJoCo-Warp solver such that:
+\begin{itemize}
+  \item tire--terrain interaction is handled \emph{explicitly} (Chrono-style) via externally applied wrenches,
+  \item the same core collision and tire-force logic used in production is validated by unit tests against Chrono (ground truth),
+  \item the implementation supports \texttt{nworld=2} and is ready for warp-batched execution.
+\end{itemize}
+Chrono remains the ground-truth oracle; we do not modify Chrono to make tests pass.
+
+\subsection{Design Choice: ``external tire forces'' via \texttt{mjcb\_control}}
+\label{sec:substep4-design-choice}
+MuJoCo computes contact forces as part of its constraint/optimization solve. Chrono's tire pipeline instead:
+\begin{enumerate}
+  \item queries terrain height/normal and computes disc--terrain contact geometry (contact patch, penetration depth),
+  \item computes tire forces/moments as explicit functions of state and contact data,
+  \item applies the resulting wrench at the wheel body.
+\end{enumerate}
+
+For massively-parallel RL, we implement the Chrono-style route by computing tire forces in a MuJoCo-Warp
+\texttt{mjcb\_control} callback and writing them to \texttt{xfrc\_applied}:
+\begin{itemize}
+  \item This callback is invoked from MuJoCo(-Warp) \texttt{forward()}, and thus is evaluated \emph{per RK4 stage}
+        (important for consistent integration).
+  \item The wheel--terrain ``contact'' is not handled by MuJoCo's contact solver; instead, wheel contact is disabled
+        (recommended: only for wheel geoms) and replaced by our explicit tire forces.
+\end{itemize}
+
+\subsection{What Was Added / Modified (Key Files)}
+\begin{itemize}
+  \item \texttt{newton/newton/\_src/vehicle/tires/mujoco\_tire\_module.py}:
+    production tire module \texttt{MujocoFialaTireModule} that computes contact, tire forces, and writes \texttt{xfrc\_applied}.
+
+  \item \texttt{newton/newton/\_src/vehicle/tires/disc\_terrain\_collision.py}:
+    MuJoCo plane/hfield terrain queries and the warp-batched disc--terrain collision kernel used by the tire module.
+    A core requirement addressed in the final review is that \emph{the same Warp collision implementation is used by production and tests}.
+
+  \item \texttt{newton/newton/\_src/solvers/mujoco/solver\_mujoco.py}:
+    installs the tire modules into \texttt{mujoco\_warp.mjcb\_control} once during initialization and
+    disables wheel collisions (recommended Chrono-like usage).
+
+  \item \texttt{newton/newton/tests/tires/test\_mujoco\_tire\_integration.py}:
+    integration tests that compare MuJoCo-Warp + \texttt{MujocoFialaTireModule} results against Chrono ground truth.
+
+  \item \texttt{newton/newton/tests/tires/test\_disc\_terrain\_collision.py}:
+    unit tests comparing the production-path disc--terrain collision kernel against Chrono ground truth for MuJoCo plane/hfield terrain.
+\end{itemize}
+
+\subsection{Production Module: \texttt{MujocoFialaTireModule}}
+\label{sec:substep4-mujoco-tire-module}
+File: \texttt{newton/newton/\_src/vehicle/tires/mujoco\_tire\_module.py}
+
+\subsubsection{Inputs and configuration}
+The module is configured with:
+\begin{itemize}
+  \item a Chrono-like \texttt{FialaTire} instance loaded from a Chrono vehicle JSON file,
+  \item a list of MuJoCo wheel body ids (\texttt{wheel\_body\_ids}),
+  \item a MuJoCo terrain geom id (\texttt{terrain\_geom\_id}),
+  \item a collision mode (\texttt{CollisionType}: single point / four points / envelope).
+\end{itemize}
+
+Two convenience constructors are provided:
+\begin{itemize}
+  \item \texttt{from\_json(...)}: provide ids directly.
+  \item \texttt{from\_mujoco\_names(...)}: resolve body/geom names using MuJoCo name-to-id lookup and validate terrain geom types.
+\end{itemize}
+Only MuJoCo \texttt{plane} and \texttt{hfield} terrains are supported in the production query helper.
+
+\subsubsection{Per-callback data flow}
+On each callback (\texttt{apply(self, m, d)}), for each world and wheel:
+\begin{enumerate}
+  \item \textbf{Disc--terrain collision}:
+    launch \texttt{\_mujoco\_disc\_terrain\_collision\_kernel} to compute:
+    \texttt{in\_contact}, penetration \texttt{depth}, friction \texttt{mu},
+    and the contact patch frame \texttt{(pos, x\_axis, y\_axis, z\_axis)}.
+
+  \item \textbf{Contact kinematics}:
+    compute wheel velocity components $(v_x, v_y, v_z)$ in the contact patch frame and the wheel spin $\omega$
+    about the disc normal (Chrono wheel axis convention).
+
+  \item \textbf{Tire forces/moments}:
+    launch \texttt{fiala\_tire\_advance\_kernel} (from substep~2) to compute:
+    $F_x, F_y, F_z, M_y, M_z$ and also the diagnostic slips $(\kappa, \alpha)$.
+
+  \item \textbf{Apply wrench}:
+    convert the tire-frame forces/moments into world-frame and write them into MuJoCo-Warp's
+    \texttt{d.xfrc\_applied[world, body]}.
+    The applied torque includes the moment shift from the contact patch to the wheel center:
+    \[
+      \boldsymbol{\tau}_{\text{center}} =
+      \boldsymbol{\tau}_{\text{patch}} + (\mathbf{r} \times \mathbf{F})
+    \]
+    with $\mathbf{r}$ being the vector from wheel center to the effective application point used by Chrono.
+\end{enumerate}
+
+\paragraph{Wheel axis convention}
+Chrono's wheel axis is the local $Y$ axis. In this integration, the disc normal is taken as the wheel $Y$ axis
+in world coordinates (MuJoCo body rotation matrix column 1). This matches the convention used in the Chrono-like
+collision pipeline (\texttt{disc\_normal}).
+
+\subsection{Terrain Query Support (MuJoCo plane + hfield)}
+\label{sec:substep4-terrain-query}
+File: \texttt{newton/newton/\_src/vehicle/tires/disc\_terrain\_collision.py}
+
+\subsubsection{Supported types}
+The production terrain query helper \texttt{\_wp\_mujoco\_terrain\_height\_normal} supports:
+\begin{itemize}
+  \item \texttt{mjGEOM\_PLANE}: height and normal computed from geom pose and geom $z$-axis,
+  \item \texttt{mjGEOM\_HFIELD}: height and normal computed using MuJoCo's grid layout + triangulation rule.
+\end{itemize}
+Unsupported types are treated as an error on the host side (validated in \texttt{from\_mujoco\_names} and at first \texttt{apply}).
+
+\subsubsection{Heightfield mapping}
+For a MuJoCo hfield:
+\begin{itemize}
+  \item local coordinates $(x,y)$ are mapped into grid cell indices $(r,c)$ using:
+    \[
+      u = \frac{x + s_x}{2s_x/(n_c-1)},\quad v = \frac{y + s_y}{2s_y/(n_r-1)}
+    \]
+  \item vertex heights are \texttt{hfield\_data[idx] * size\_z\_top},
+  \item each cell is triangulated along the diagonal $v_{00}\rightarrow v_{11}$ (MuJoCo convention),
+        and both height and normal are computed accordingly.
+\end{itemize}
+The helper supports translated and rotated hfields by transforming the query point into the hfield local frame
+using the full 3D delta (not just the $x$/$y$ components).
+
+\subsection{Deduplication Requirement: ``tests hit the production code path''}
+\label{sec:substep4-dedup}
+In the final review of substep~4, an important correctness requirement was enforced:
+\begin{quote}
+  The production kernels used by \texttt{MujocoFialaTireModule} must be the same kernels exercised in unit tests.
+\end{quote}
+
+\subsubsection{Single shared collision implementation}
+Warp kernels cannot use Chrono-style OO polymorphism inside device code. The implemented solution is:
+\begin{itemize}
+  \item a single core Warp function \texttt{\_wp\_disc\_terrain\_collision(...)} implementing the Chrono
+        1pt/4pt/envelope algorithms while querying terrain via \texttt{\_wp\_mujoco\_terrain\_height\_normal},
+  \item a production kernel \texttt{\_mujoco\_disc\_terrain\_collision\_kernel} that computes disc center/normal
+        from MuJoCo state and then calls the shared function,
+  \item a test wrapper kernel \texttt{\_disc\_terrain\_collision\_mujoco\_kernel} that accepts externally provided
+        disc center/normal arrays and calls the same shared function.
+\end{itemize}
+This matches Chrono's structure conceptually: a single collision algorithm calling a terrain query interface.
+
+\subsection{Solver Integration: installing tire modules and disabling wheel contacts}
+\label{sec:substep4-solver}
+File: \texttt{newton/newton/\_src/solvers/mujoco/solver\_mujoco.py}
+
+\subsubsection{Callback installation}
+If tire modules are provided to the solver, the solver installs a chained MuJoCo-Warp control callback once
+at initialization time:
+\begin{itemize}
+  \item any previous callback is called first (if present),
+  \item then each tire module's \texttt{apply(m, d)} method is executed.
+\end{itemize}
+This avoids reassigning the callback every step and ensures failures are not hidden by callback restoration.
+
+\subsubsection{Disabling MuJoCo contact handling for wheels}
+For Chrono-style external tire forces, wheel geoms should not participate in MuJoCo contact.
+The solver disables collisions for all geoms attached to the wheel bodies declared by the tire modules by setting:
+\texttt{geom\_contype = 0} and \texttt{geom\_conaffinity = 0}.
+
+\subsection{Tests}
+\label{sec:substep4-tests}
+
+\subsubsection{Disc--terrain collision tests (unit)}
+File: \texttt{newton/newton/tests/tires/test\_disc\_terrain\_collision.py}
+\begin{itemize}
+  \item Launches the MuJoCo-path collision wrapper kernel (\texttt{\_disc\_terrain\_collision\_mujoco\_kernel})
+        on CPU for \texttt{nworld=2}.
+  \item Compares outputs (\texttt{in\_contact, depth, mu, contact frame}) against Chrono ground truth via the CLI oracle.
+  \item Validates both MuJoCo plane and MuJoCo hfield (sinusoid is represented as an hfield, avoiding analytic test-only terrain in production code).
+\end{itemize}
+
+\subsubsection{MuJoCo-Warp + tire module integration tests}
+File: \texttt{newton/newton/tests/tires/test\_mujoco\_tire\_integration.py}
+\begin{itemize}
+  \item \textbf{RK4 callback stage correctness}:
+        verifies that \texttt{mjcb\_control} is called 4 times per step when using RK4 integration.
+  \item \textbf{Plane ground truth comparison}:
+        applies \texttt{MujocoFialaTireModule} and compares \texttt{xfrc\_applied} at the wheel to a Chrono-derived wrench.
+        The test includes a contact and a no-contact world and asserts contact actually occurs in the contact case.
+  \item \textbf{Heightfield ground truth comparison}:
+        repeats the same idea on a MuJoCo hfield terrain. The ``sinusoid'' surface is encoded into the hfield.
+        The test validates all collision modes.
+\end{itemize}
+
+\subsection{Running the Tests}
+From the workspace root:
+\begin{verbatim}
+PYTHONPATH=./newton:./mujoco_warp \
+  newton/.venv/bin/python -m unittest -v newton.tests.tires.test_disc_terrain_collision
+
+PYTHONPATH=./newton:./mujoco_warp \
+  newton/.venv/bin/python -m unittest -v newton.tests.tires.test_mujoco_tire_integration
+\end{verbatim}
+
+\paragraph{Warp cache path}
+If Warp cannot write to \texttt{\$HOME/.cache/warp}, set:
+\begin{verbatim}
+export WARP_CACHE_PATH=$(pwd)/.warp_cache
+\end{verbatim}
+The tire tests also force a repo-local kernel cache at import time to make runs robust in sandboxed environments.
+
+\paragraph{Chrono oracle binary}
+The tests require the Chrono ground-truth CLI from substep~0.
+If missing, build it as documented in:
+\texttt{newton/newton/tests/tires/chrono\_gt/README.md}
+or set \texttt{NEWTON\_CHRONO\_GT\_BIN} to an existing binary.
+
+\subsection{Current Scope / Limitations}
+\begin{itemize}
+  \item Production terrain query supports only MuJoCo \texttt{plane} and \texttt{hfield} terrains.
+  \item The current integration compares forces/moments at the wheel center; trajectory-level matching is deferred to substep~5.
+  \item Additional Newton-facing ``wheel tagging'' and full vehicle authoring UX can be expanded as needed, but is not required for the unit-tested core pipeline.
+\end{itemize}
+

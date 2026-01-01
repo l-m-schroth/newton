@@ -296,7 +296,7 @@ class TestMujocoWarpFialaTireIntegration(unittest.TestCase):
                         _assert_close(self, act_f[i], exp_f[i], rtol=2e-4, atol=5e-4)
                         _assert_close(self, act_m[i], exp_m[i], rtol=2e-4, atol=5e-4)
 
-    def test_hfield_matches_chrono_for_single_point_nworld_2(self):
+    def test_hfield_matches_chrono_all_collision_nworld_2(self):
         tire_json = _chrono_tire_path("vehicle/generic/tire/FialaTire.json")
 
         # Small sinusoidal heightfield, encoded via `elevation` and normalized by MuJoCo to [0, 1].
