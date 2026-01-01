@@ -594,6 +594,7 @@ class HFieldTerrain:
     def GetProperties(self, loc: Vec3) -> tuple[float, Vec3, float]:
         return (self.GetHeight(loc), self.GetNormal(loc), float(self.mu))
 
+""" Warp functionality"""
 
 @wp.func
 def _wp_cross(a: wp.vec3, b: wp.vec3) -> wp.vec3:
@@ -632,7 +633,7 @@ def _wp_height(p: wp.vec3) -> float:
 # --------------------------------------------------------------------------------------
 #
 # These functions implement a minimal Chrono-style terrain query interface (height/normal)
-# for MuJoCo terrain geoms. They are used in the MuJoCo-Warp tire integration (substep 4).
+# for MuJoCo terrain geoms. They are used in the MuJoCo-Warp tire integration.
 #
 # Note: We intentionally only support MuJoCo `plane` and `hfield` geoms here.
 
@@ -1300,7 +1301,7 @@ def _mujoco_disc_terrain_collision_kernel(
 
 
 @wp.kernel
-def _disc_terrain_collision_mujoco_kernel(
+def _tests_disc_terrain_collision_kernel(
     # MuJoCo model (subset):
     geom_type: wp.array(dtype=int),
     geom_dataid: wp.array(dtype=int),

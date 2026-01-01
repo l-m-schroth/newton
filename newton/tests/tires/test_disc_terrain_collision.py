@@ -35,7 +35,7 @@ from newton._src.vehicle.tires.disc_terrain_collision import (
     CollisionType,
     ConstructAreaDepthTable,
     HFieldTerrain,
-    _disc_terrain_collision_mujoco_kernel,
+    _tests_disc_terrain_collision_kernel,
     _v_normalize,
 )
 from newton.tests.tires.chrono_gt import run_chrono_gt
@@ -165,7 +165,7 @@ def _run_warp_mujoco_disc_terrain_collision(
     z_axis_out = wp.empty(nworld, dtype=wp.vec3, device=device)
 
     wp.launch(
-        _disc_terrain_collision_mujoco_kernel,
+        _tests_disc_terrain_collision_kernel,
         dim=nworld,
         inputs=[
             geom_type,
@@ -256,10 +256,10 @@ class TestDiscTerrainCollisionAgainstChrono(unittest.TestCase):
                         _assert_close(self, float(batched["depth"][i]), float(gt["depth"]), rtol=1e-6, atol=1e-6)
                         _assert_close(self, float(batched["mu"][i]), float(gt["mu"]), rtol=1e-6, atol=1e-6)
 
-                        if i == 0:
+                        if i == 0: # Make sure we are in contact for the scenario where we actually want contacts
                             self.assertTrue(gt["in_contact"])
                             self.assertTrue(batched["in_contact"][i])
-                        else:
+                        else: # No contact in contact scenario
                             self.assertFalse(gt["in_contact"])
                             self.assertFalse(batched["in_contact"][i])
 
