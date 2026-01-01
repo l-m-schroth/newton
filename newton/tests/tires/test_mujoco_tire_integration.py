@@ -371,57 +371,62 @@ class TestMujocoWarpFialaTireIntegration(unittest.TestCase):
         qpos[1, 2] = disc_radius + h0 + 0.05
         d.qpos = wp.array(qpos, dtype=float, device=d.qpos.device)
 
-        module = MujocoFialaTireModule.from_mujoco_names(
-            mjm,
-            tire_json,
-            wheel_body_names=["wheel"],
-            terrain_geom_name="ground",
-            collision_type=CollisionType.SINGLE_POINT,
-        )
-        mujoco_warp.mjcb_control = module.apply
-        mujoco_warp.forward(m, d)
+        for method in [CollisionType.SINGLE_POINT, CollisionType.FOUR_POINTS, CollisionType.ENVELOPE]:
+            with self.subTest(method=method):
+                # Sentinel to ensure the callback overwrites.
+                d.xfrc_applied.fill_(wp.spatial_vector(123.0, -456.0, 789.0, 1.0, 2.0, 3.0))
 
-        xipos = d.xipos.numpy()
-        xmat = d.xmat.numpy()
-        cvel = d.cvel.numpy()
-        xfrc = d.xfrc_applied.numpy()
+                module = MujocoFialaTireModule.from_mujoco_names(
+                    mjm,
+                    tire_json,
+                    wheel_body_names=["wheel"],
+                    terrain_geom_name="ground",
+                    collision_type=method,
+                )
+                mujoco_warp.mjcb_control = module.apply
+                mujoco_warp.forward(m, d)
 
-        for worldid in range(2):
-            disc_center = tuple(float(x) for x in xipos[worldid, wheel_id])
-            disc_normal = (
-                float(xmat[worldid, wheel_id, 0, 1]),
-                float(xmat[worldid, wheel_id, 1, 1]),
-                float(xmat[worldid, wheel_id, 2, 1]),
-            )
-            omega_world = tuple(float(x) for x in cvel[worldid, wheel_id, 0:3])
-            vel_world = tuple(float(x) for x in cvel[worldid, wheel_id, 3:6])
+                xipos = d.xipos.numpy()
+                xmat = d.xmat.numpy()
+                cvel = d.cvel.numpy()
+                xfrc = d.xfrc_applied.numpy()
 
-            exp_f, exp_m = _chronos_force_wrench_world(
-                tire_json=tire_json,
-                collision_type=CollisionType.SINGLE_POINT,
-                disc_center=disc_center,
-                disc_normal=disc_normal,
-                vel_world=vel_world,
-                omega_world=omega_world,
-                wheel_center=disc_center,
-                terrain=terrain,
-            )
+                for worldid in range(2):
+                    disc_center = tuple(float(x) for x in xipos[worldid, wheel_id])
+                    disc_normal = (
+                        float(xmat[worldid, wheel_id, 0, 1]),
+                        float(xmat[worldid, wheel_id, 1, 1]),
+                        float(xmat[worldid, wheel_id, 2, 1]),
+                    )
+                    omega_world = tuple(float(x) for x in cvel[worldid, wheel_id, 0:3])
+                    vel_world = tuple(float(x) for x in cvel[worldid, wheel_id, 3:6])
 
-            act_f = tuple(float(x) for x in xfrc[worldid, wheel_id, 0:3])
-            act_m = tuple(float(x) for x in xfrc[worldid, wheel_id, 3:6])
+                    exp_f, exp_m = _chronos_force_wrench_world(
+                        tire_json=tire_json,
+                        collision_type=method,
+                        disc_center=disc_center,
+                        disc_normal=disc_normal,
+                        vel_world=vel_world,
+                        omega_world=omega_world,
+                        wheel_center=disc_center,
+                        terrain=terrain,
+                    )
 
-            if worldid == 0:
-                self.assertGreater(exp_f[2], 0.0)
-                self.assertGreater(act_f[2], 0.0)
-            else:
-                self.assertEqual(exp_f, (0.0, 0.0, 0.0))
-                self.assertEqual(exp_m, (0.0, 0.0, 0.0))
-                self.assertEqual(act_f, (0.0, 0.0, 0.0))
-                self.assertEqual(act_m, (0.0, 0.0, 0.0))
+                    act_f = tuple(float(x) for x in xfrc[worldid, wheel_id, 0:3])
+                    act_m = tuple(float(x) for x in xfrc[worldid, wheel_id, 3:6])
 
-            for i in range(3):
-                _assert_close(self, act_f[i], exp_f[i], rtol=3e-4, atol=1e-2)
-                _assert_close(self, act_m[i], exp_m[i], rtol=3e-4, atol=1e-2)
+                    if worldid == 0:
+                        self.assertGreater(exp_f[2], 0.0)
+                        self.assertGreater(act_f[2], 0.0)
+                    else:
+                        self.assertEqual(exp_f, (0.0, 0.0, 0.0))
+                        self.assertEqual(exp_m, (0.0, 0.0, 0.0))
+                        self.assertEqual(act_f, (0.0, 0.0, 0.0))
+                        self.assertEqual(act_m, (0.0, 0.0, 0.0))
+
+                    for i in range(3):
+                        _assert_close(self, act_f[i], exp_f[i], rtol=3e-4, atol=1e-2)
+                        _assert_close(self, act_m[i], exp_m[i], rtol=3e-4, atol=1e-2)
 
 
 if __name__ == "__main__":
