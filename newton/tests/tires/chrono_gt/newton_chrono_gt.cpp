@@ -3,6 +3,7 @@
 // This executable is intentionally small and only depends on Chrono. It reads a JSON request from stdin and prints a
 // JSON response to stdout. It is used by Python unit tests to compare Newton implementations against Chrono outputs.
 
+#include <algorithm>
 #include <cmath>
 #include <exception>
 #include <iostream>
@@ -13,11 +14,17 @@
 #include <array>
 #include <vector>
 
+#include "chrono/core/ChTypes.h"
+#include "chrono/physics/ChSystemNSC.h"
+
+#include "chrono/functions/ChFunctionConst.h"
+#include "chrono/functions/ChFunctionSine.h"
 #include "chrono/functions/ChFunctionSineStep.h"
 #include "chrono/utils/ChUtils.h"
 
 #include "chrono_vehicle/ChTerrain.h"
 #include "chrono_vehicle/wheeled_vehicle/ChTire.h"
+#include "chrono_vehicle/wheeled_vehicle/test_rig/ChTireTestRig.h"
 #include "chrono_vehicle/wheeled_vehicle/tire/FialaTire.h"
 #include "chrono_vehicle/utils/ChUtilsJSON.h"
 
@@ -485,6 +492,19 @@ chrono::vehicle::ChTire::CollisionType ParseCollisionType(const std::string& s) 
     Throw(std::string("unsupported collision_type: ") + s);
 }
 
+chrono::vehicle::ChTireTestRig::Mode ParseTireTestRigMode(const std::string& s) {
+    if (s == "suspend") {
+        return chrono::vehicle::ChTireTestRig::Mode::SUSPEND;
+    }
+    if (s == "drop") {
+        return chrono::vehicle::ChTireTestRig::Mode::DROP;
+    }
+    if (s == "test") {
+        return chrono::vehicle::ChTireTestRig::Mode::TEST;
+    }
+    Throw(std::string("unsupported rig_mode: ") + s);
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -663,6 +683,137 @@ int main(int argc, char** argv) {
             AddVec3(contact_obj, alloc, "z_axis", A.GetAxisZ());
             resp.AddMember("contact", contact_obj, alloc);
             resp.AddMember("ok", true, alloc);
+        } else if (cmd == "tire_test_rig") {
+            // Chrono reference: chrono/src/chrono_vehicle/wheeled_vehicle/test_rig/ChTireTestRig.cpp
+            // Chrono reference: chrono/src/demos/vehicle/test_rigs/demo_VEH_TireTestRig.cpp
+
+            const std::string wheel_json = GetString(req, "wheel_json");
+            const std::string tire_json = GetString(req, "tire_json");
+            const std::string mode_str = GetString(req, "mode");
+            const auto rig_mode = ParseTireTestRigMode(mode_str);
+
+            const double dt = req.HasMember("dt") ? GetNumber(req, "dt") : 1e-3;
+            const double t_end = req.HasMember("t_end") ? GetNumber(req, "t_end") : 2.0;
+            const int decimate = req.HasMember("decimate") ? int(GetNumber(req, "decimate")) : 1;
+            const double grav = req.HasMember("grav") ? GetNumber(req, "grav") : 9.8;
+            const double normal_load = req.HasMember("normal_load") ? GetNumber(req, "normal_load") : 3000.0;
+            const double camber = req.HasMember("camber") ? GetNumber(req, "camber") : 0.0;
+            const double time_delay = req.HasMember("time_delay") ? GetNumber(req, "time_delay") : 1.0;
+
+            const std::string coll_str =
+                req.HasMember("collision_type") ? GetString(req, "collision_type") : "four_points";
+            const auto coll_type = ParseCollisionType(coll_str);
+
+            const double long_speed = req.HasMember("long_speed") ? GetNumber(req, "long_speed") : 0.2;
+            const double ang_speed = req.HasMember("ang_speed") ? GetNumber(req, "ang_speed") : (10.0 * (2.0 * chrono::CH_PI / 60.0));
+            const double sa_ampl =
+                req.HasMember("slip_angle_ampl") ? GetNumber(req, "slip_angle_ampl") : (5.0 * (chrono::CH_PI / 180.0));
+            const double sa_freq = req.HasMember("slip_angle_freq") ? GetNumber(req, "slip_angle_freq") : 0.2;
+            const double sa_phase = req.HasMember("slip_angle_phase") ? GetNumber(req, "slip_angle_phase") : 0.0;
+            const double sa_shift = req.HasMember("slip_angle_shift") ? GetNumber(req, "slip_angle_shift") : 0.0;
+
+            // Terrain defaults match the Chrono demo.
+            const double terrain_length = req.HasMember("terrain_length") ? GetNumber(req, "terrain_length") : 10.0;
+            const double terrain_width = req.HasMember("terrain_width") ? GetNumber(req, "terrain_width") : 1.0;
+            const float terrain_mu = static_cast<float>(req.HasMember("terrain_mu") ? GetNumber(req, "terrain_mu") : 0.8);
+            const float terrain_restitution =
+                static_cast<float>(req.HasMember("terrain_restitution") ? GetNumber(req, "terrain_restitution") : 0.0);
+            const float terrain_young =
+                static_cast<float>(req.HasMember("terrain_young_modulus") ? GetNumber(req, "terrain_young_modulus") : 2e7);
+
+            if (dt <= 0.0) {
+                Throw("tire_test_rig: dt must be > 0");
+            }
+            if (t_end < 0.0) {
+                Throw("tire_test_rig: t_end must be >= 0");
+            }
+            if (decimate <= 0) {
+                Throw("tire_test_rig: decimate must be > 0");
+            }
+
+            auto wheel = chrono::vehicle::ReadWheelJSON(wheel_json);
+            auto tire = chrono::vehicle::ReadTireJSON(tire_json);
+            if (!wheel) {
+                Throw(std::string("failed to read wheel JSON: ") + wheel_json);
+            }
+            if (!tire) {
+                Throw(std::string("failed to read tire JSON: ") + tire_json);
+            }
+
+            chrono::ChSystemNSC sys;
+            chrono::vehicle::ChTireTestRig rig(wheel, tire, &sys);
+
+            rig.SetGravitationalAcceleration(grav);
+            rig.SetNormalLoad(normal_load);
+            rig.SetCamberAngle(camber);
+            rig.SetTireStepsize(dt);
+            rig.SetTireCollisionType(coll_type);
+
+            chrono::vehicle::ChTireTestRig::TerrainPatchSize size;
+            size.length = terrain_length;
+            size.width = terrain_width;
+            chrono::vehicle::ChTireTestRig::TerrainParamsRigid params;
+            params.friction = terrain_mu;
+            params.restitution = terrain_restitution;
+            params.Young_modulus = terrain_young;
+            rig.SetTerrainRigid(size, params);
+
+            if (rig_mode == chrono::vehicle::ChTireTestRig::Mode::TEST) {
+                rig.SetLongSpeedFunction(chrono_types::make_shared<chrono::ChFunctionConst>(long_speed));
+                rig.SetAngSpeedFunction(chrono_types::make_shared<chrono::ChFunctionConst>(ang_speed));
+                rig.SetSlipAngleFunction(chrono_types::make_shared<chrono::ChFunctionSine>(sa_ampl, sa_freq, sa_phase, sa_shift));
+                rig.SetTimeDelay(time_delay);
+            } else {
+                rig.SetTimeDelay(time_delay);
+            }
+
+            rig.Initialize(rig_mode);
+
+            const int nsteps = int(std::round(t_end / dt));
+            rj::Value samples(rj::kArrayType);
+            samples.Reserve(std::max(0, (nsteps + decimate - 1) / decimate), alloc);
+
+            for (int i = 0; i < nsteps; ++i) {
+                rig.Advance(dt);
+
+                if ((i % decimate) != 0) {
+                    continue;
+                }
+
+                const double t = sys.GetChTime();
+                const double slip = rig.GetLongitudinalSlip();
+                const double slip_angle = rig.GetSlipAngle();
+                const double camber_angle = rig.GetCamberAngle();
+
+                const auto tf = rig.ReportTireForce();
+                const auto spindle = rig.GetSpindle();
+
+                rj::Value s(rj::kObjectType);
+                s.AddMember("t", t, alloc);
+                s.AddMember("slip", slip, alloc);
+                s.AddMember("slip_angle", slip_angle, alloc);
+                s.AddMember("camber_angle", camber_angle, alloc);
+
+                rj::Value force_obj(rj::kObjectType);
+                AddVec3(force_obj, alloc, "force", tf.force);
+                AddVec3(force_obj, alloc, "moment", tf.moment);
+                AddVec3(force_obj, alloc, "point", tf.point);
+                s.AddMember("tire_force", force_obj, alloc);
+
+                rj::Value spindle_obj(rj::kObjectType);
+                AddVec3(spindle_obj, alloc, "pos", spindle->GetPos());
+                AddVec3(spindle_obj, alloc, "vel", spindle->GetPosDt());
+                AddVec3(spindle_obj, alloc, "omega_local", spindle->GetAngVelLocal());
+                s.AddMember("spindle", spindle_obj, alloc);
+
+                samples.PushBack(s, alloc);
+            }
+
+            resp.AddMember("dt", dt, alloc);
+            resp.AddMember("t_end", t_end, alloc);
+            resp.AddMember("decimate", decimate, alloc);
+            resp.AddMember("ok", true, alloc);
+            resp.AddMember("samples", samples, alloc);
         } else {
             Throw(std::string("unsupported cmd: ") + cmd);
         }

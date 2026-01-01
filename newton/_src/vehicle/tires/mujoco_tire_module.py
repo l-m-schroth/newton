@@ -29,6 +29,9 @@ from .fiala_tire import FialaTire, fiala_tire_advance_kernel
 def _mujoco_tire_contact_kinematics_kernel(
     xmat: wp.array2d(dtype=wp.mat33),
     cvel: wp.array2d(dtype=wp.spatial_vector),
+    body_rootid: wp.array(dtype=int),
+    subtree_com: wp.array2d(dtype=wp.vec3),
+    xipos: wp.array2d(dtype=wp.vec3),
     wheel_body_ids: wp.array(dtype=int),
     nwheels: int,
     contact_x: wp.array(dtype=wp.vec3),
@@ -58,7 +61,12 @@ def _mujoco_tire_contact_kinematics_kernel(
 
     w = cvel[worldid, bodyid]  # (ang:lin) in world
     omega_world = wp.vec3(w[0], w[1], w[2])
-    vel_world = wp.vec3(w[3], w[4], w[5])
+    # MuJoCo stores `cvel` as com-based spatial velocity, expressed at the subtree COM of the kinematic tree root.
+    # Convert to the world linear velocity at the wheel center (disc center).
+    rootid = body_rootid[bodyid]
+    dif = xipos[worldid, bodyid] - subtree_com[worldid, rootid]
+    vel_com = wp.vec3(w[3], w[4], w[5])
+    vel_world = vel_com - wp.cross(dif, omega_world)
 
     cx = contact_x[tid]
     cy = contact_y[tid]
@@ -341,6 +349,9 @@ class MujocoFialaTireModule:
             inputs=[
                 d.xmat,
                 d.cvel,
+                m.body_rootid,
+                d.subtree_com,
+                d.xipos,
                 self._wheel_body_ids_wp,
                 int(nwheels),
                 self._contact_x,

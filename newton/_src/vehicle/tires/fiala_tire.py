@@ -406,6 +406,10 @@ def _wp_fiala_patch_forces(
     width: float,
 ) -> wp.vec3:
     # Chrono reference: chrono/src/chrono_vehicle/wheeled_vehicle/tire/ChFialaTire.cpp::FialaPatchForces
+    # Guard against fz=0 which would otherwise trigger 0/0 in the Chrono algebra (and is physically "no contact").
+    if fz <= 0.0:
+        return wp.vec3(0.0, 0.0, 0.0)
+
     tan_alpha = wp.tan(alpha)
     SsA = wp.min(1.0, wp.sqrt(kappa * kappa + tan_alpha * tan_alpha))
     U = u_max - (u_max - u_min) * SsA
