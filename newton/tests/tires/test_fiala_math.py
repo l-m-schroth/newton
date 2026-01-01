@@ -16,8 +16,14 @@
 from __future__ import annotations
 
 import math
+import os
 import unittest
 from pathlib import Path
+
+_REPO_ROOT = Path(__file__).resolve().parents[4]
+
+# Keep Warp cache inside the repo by default (helps when running in sandboxed environments).
+os.environ.setdefault("WARP_CACHE_PATH", str(_REPO_ROOT / ".warp_cache"))
 
 import warp as wp
 
@@ -27,7 +33,12 @@ from newton.tests.tires.chrono_gt import run_chrono_gt
 
 
 def _repo_root() -> Path:
-    return Path(__file__).resolve().parents[4]
+    return _REPO_ROOT
+
+
+if wp.config.kernel_cache_dir != os.environ["WARP_CACHE_PATH"]:
+    Path(os.environ["WARP_CACHE_PATH"]).mkdir(parents=True, exist_ok=True)
+    wp.config.kernel_cache_dir = os.environ["WARP_CACHE_PATH"]
 
 
 def _chrono_tire_path(rel: str) -> str:

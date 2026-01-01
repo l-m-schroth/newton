@@ -23,6 +23,12 @@ from pathlib import Path
 import sys
 
 import mujoco
+
+_REPO_ROOT = Path(__file__).resolve().parents[4]
+
+# Keep Warp cache inside the repo by default (helps when running in sandboxed environments).
+os.environ.setdefault("WARP_CACHE_PATH", str(_REPO_ROOT / ".warp_cache"))
+
 import warp as wp
 
 # Import mujoco_warp as a package (not the workspace namespace dir).
@@ -35,7 +41,12 @@ from newton.tests.tires.chrono_gt import run_chrono_gt
 
 
 def _repo_root() -> Path:
-    return Path(__file__).resolve().parents[4]
+    return _REPO_ROOT
+
+
+if wp.config.kernel_cache_dir != os.environ["WARP_CACHE_PATH"]:
+    Path(os.environ["WARP_CACHE_PATH"]).mkdir(parents=True, exist_ok=True)
+    wp.config.kernel_cache_dir = os.environ["WARP_CACHE_PATH"]
 
 
 def _chrono_tire_path(rel: str) -> str:
@@ -159,11 +170,6 @@ def _chronos_force_wrench_world(
 
 
 class TestMujocoWarpFialaTireIntegration(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls) -> None:
-        # Keep Warp cache inside the repo by default (helps when running in sandboxed environments).
-        os.environ.setdefault("WARP_CACHE_PATH", str(_repo_root() / ".warp_cache"))
-
     def tearDown(self) -> None:
         mujoco_warp.mj_resetCallbacks()
 
