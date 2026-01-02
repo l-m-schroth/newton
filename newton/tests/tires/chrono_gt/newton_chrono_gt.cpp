@@ -716,6 +716,7 @@ int main(int argc, char** argv) {
             const double terrain_length = req.HasMember("terrain_length") ? GetNumber(req, "terrain_length") : 10.0;
             const double terrain_width = req.HasMember("terrain_width") ? GetNumber(req, "terrain_width") : 1.0;
             const float terrain_mu = static_cast<float>(req.HasMember("terrain_mu") ? GetNumber(req, "terrain_mu") : 0.8);
+            // NOTE (Lukas): For Force-Element Tires with explicit/soft normal force laws like fiala, normal force is not determined by resititution and young modulus
             const float terrain_restitution =
                 static_cast<float>(req.HasMember("terrain_restitution") ? GetNumber(req, "terrain_restitution") : 0.0);
             const float terrain_young =

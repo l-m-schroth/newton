@@ -80,6 +80,18 @@ def _chrono_data_path(rel: str) -> str:
 
 
 def _quat_from_angle_x(angle: float) -> tuple[float, float, float, float]:
+    # Quaternion for rotation about +X by `angle` (Newton/Warp internal `xyzw` convention):
+    # q_xyzw = (sin(angle/2), 0, 0, cos(angle/2)).
+    #
+    # Convention references:
+    # - Newton internal quats are `xyzw`: `newton/newton/_src/sim/builder.py` (see docstrings mentioning `xyzw`).
+    # - Chrono quats are stored as `wxyz` (`e0,e1,e2,e3` = real, i, j, k): `chrono/src/chrono/core/ChQuaternion.h`.
+    #
+    # Chrono formula references (wxyz storage):
+    # - `chrono/src/chrono/core/ChRotation.cpp::QuatFromAngleAxis` (axis-angle: w=cos(a/2), v=axis*sin(a/2))
+    # - `chrono/src/chrono/core/ChRotation.cpp::QuatFromAngleX` (calls QuatFromAngleAxis with axis=(1,0,0))
+
+
     s = math.sin(0.5 * angle)
     c = math.cos(0.5 * angle)
     return (s, 0.0, 0.0, c)  # xyzw
@@ -206,6 +218,11 @@ def _build_newton_rig_model(
         )
         # Ensure there is at least one world-local shape so SolverMuJoCo can pick the "first world" group when
         # operating in `separate_worlds=True` mode (it uses `shape_world` to determine the template world).
+        # NOTE(separate_worlds): With `separate_worlds=True`, SolverMuJoCo converts one “template world” to a MuJoCo model
+        # and then runs it batched via MuJoCo-Warp (`nworld > 1`). The template world is chosen by SolverMuJoCo as the
+        # smallest non-negative id appearing in `model.shape_world` (geoms/sites). If the model has no shapes, this
+        # heuristic can’t pick a proper template world, so we add a tiny `as_site=True` shape to ensure selection works.
+
         b.add_shape_sphere(body=carrier, radius=0.01, as_site=True, key="rig_site")
         chassis = b.add_link(
             xform=((0.0, 0.0, 0.0), (0.0, 0.0, 0.0, 1.0)),
@@ -283,7 +300,7 @@ def _build_newton_rig_model(
             armature=0.0,
             key="slip_yaw",
         )
-
+        # NOTE (Lukas): with zero camber wheel spin is around Y-axis. 
         wheel_axis = (0.0, math.cos(camber), -math.sin(camber))
         j_wheel = b.add_joint_revolute(
             slip,
@@ -351,6 +368,7 @@ def _run_newton_rig(
 
     state_0, state_1 = model.state(), model.state()
     control = model.control()
+    # Call Newton collision once only to get the container for stepping, we use Mujoco colission + tire module later. 
     contacts = model.collide(state_0)
 
     solver = SolverMuJoCo(model, use_mujoco_contacts=True)
@@ -490,8 +508,10 @@ def _run_newton_rig(
                 slip[w, sample_idx] = ((disc_radius * o) - vx) / abs_vx if abs_vx > 1e-4 else 0.0
 
                 # ChTireTestRig::GetSlipAngle / GetCamberAngle
-                dir_y = xmat[w, wheel_id, :, 1]
+                dir_y = xmat[w, wheel_id, :, 1] # get y-axis
                 slip_angle[w, sample_idx] = math.atan(float(dir_y[0]) / float(dir_y[1]))
+                # NOTE (Lukas): Shouldn't the camber angle here be gamma = math.atan2(-dir_y[2], math.sqrt(dir_y[0]**2 + dir_y[1]**2))?
+                # Anyways, I leave it exactly as the chrono reference to exactly match the output.
                 camber_angle[w, sample_idx] = math.atan(-float(dir_y[2]))
 
         sample_idx += 1
@@ -520,7 +540,7 @@ class TestTireTestRig(unittest.TestCase):
         tire_json = _chrono_data_path("vehicle/generic/tire/FialaTire.json")
         wheel_json = _chrono_data_path("vehicle/generic/wheel/WheelSimple.json")
 
-        dt = 1e-3
+        dt = 1e-3 # chrono demo uses 2e-4 by default
         t_end = 2.0
         decimate = 10
         grav = 9.8
