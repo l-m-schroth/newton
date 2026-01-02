@@ -28,6 +28,7 @@ _REPO_ROOT = Path(__file__).resolve().parents[4]
 
 # Keep Warp cache inside the repo by default (helps when running in sandboxed environments).
 os.environ.setdefault("WARP_CACHE_PATH", str(_REPO_ROOT / ".warp_cache"))
+os.environ.setdefault("MPLBACKEND", "Agg")
 
 import warp as wp
 
@@ -102,6 +103,58 @@ def _assert_allclose(testcase: unittest.TestCase, actual: np.ndarray, expected: 
     diff = np.max(np.abs(actual - expected))
     tol = atol + rtol * np.max(np.abs(expected))
     testcase.assertLessEqual(diff, tol, msg=f"{msg}: max_abs_err={diff} tol={tol}")
+
+
+def _collision_type_cases() -> list[tuple[CollisionType, str]]:
+    return [
+        (CollisionType.SINGLE_POINT, "single_point"),
+        (CollisionType.FOUR_POINTS, "four_points"),
+        (CollisionType.ENVELOPE, "envelope"),
+    ]
+
+
+def _plot_dir() -> Path:
+    return Path(__file__).resolve().parent / "tire_rig_plots"
+
+
+def _save_force_moment_plots(
+    *,
+    filename: str,
+    t: np.ndarray,
+    chrono_force: np.ndarray,
+    chrono_moment: np.ndarray,
+    newton_force: np.ndarray,
+    newton_moment: np.ndarray,
+) -> None:
+    import matplotlib.pyplot as plt
+
+    out_dir = _plot_dir()
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir / filename
+
+    fig, ax = plt.subplots(3, 2, figsize=(11.0, 8.0), sharex=True)
+
+    panels = [
+        (ax[0, 0], "Longitudinal Tire Force in the Global ISO Frame", "Force (N)", chrono_force[:, 0], newton_force[:, 0]),
+        (ax[0, 1], "Lateral Tire Force in the Global ISO Frame", "Force (N)", chrono_force[:, 1], newton_force[:, 1]),
+        (ax[1, 0], "Vertical Tire Force in the Global ISO Frame", "Force (N)", chrono_force[:, 2], newton_force[:, 2]),
+        (ax[1, 1], "X Tire Moment in the Global ISO Frame", "Moment (Nm)", chrono_moment[:, 0], newton_moment[:, 0]),
+        (ax[2, 0], "Y Tire Moment in the Global ISO Frame", "Moment (Nm)", chrono_moment[:, 1], newton_moment[:, 1]),
+        (ax[2, 1], "Z Tire Moment in the Global ISO Frame", "Moment (Nm)", chrono_moment[:, 2], newton_moment[:, 2]),
+    ]
+
+    for a, title, ylabel, y_chrono, y_newton in panels:
+        a.plot(t, y_chrono, linestyle="--", marker="o", markersize=3.0, linewidth=1.2, label="Chrono")
+        a.plot(t, y_newton, linestyle="-", marker="s", markersize=3.0, linewidth=1.2, label="Newton")
+        a.set_title(title, fontsize=10)
+        a.set_ylabel(ylabel)
+        a.legend(fontsize=8)
+
+    ax[2, 0].set_xlabel("Time (s)")
+    ax[2, 1].set_xlabel("Time (s)")
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
 
 
 def _parse_chrono_rig_samples(resp: dict[str, object]) -> dict[str, np.ndarray]:
@@ -540,7 +593,7 @@ class TestTireTestRig(unittest.TestCase):
         tire_json = _chrono_data_path("vehicle/generic/tire/FialaTire.json")
         wheel_json = _chrono_data_path("vehicle/generic/wheel/WheelSimple.json")
 
-        dt = 1e-3 # chrono demo uses 2e-4 by default
+        dt = 1e-3 # chrono demo uses 2e-4 for NSG
         t_end = 2.0
         decimate = 10
         grav = 9.8
@@ -558,74 +611,88 @@ class TestTireTestRig(unittest.TestCase):
         disc_radius = float(load_chrono_vehicle_json(tire_json)["Fiala Parameters"]["Unloaded Radius"])
         terrain_height = -0.4 - disc_radius - 0.1  # Chrono reference: ChTireTestRig.cpp::CreateMechanism
 
-        gt = run_chrono_gt(
-            {
-                "cmd": "tire_test_rig",
-                "mode": "test",
-                "wheel_json": wheel_json,
-                "tire_json": tire_json,
-                "dt": dt,
-                "t_end": t_end,
-                "decimate": decimate,
-                "grav": grav,
-                "normal_load": normal_load,
-                "camber": camber,
-                "time_delay": time_delay,
-                "collision_type": "four_points",
-                "long_speed": long_speed,
-                "ang_speed": ang_speed,
-                "slip_angle_ampl": sa_ampl,
-                "slip_angle_freq": sa_freq,
-                "slip_angle_phase": sa_phase,
-                "slip_angle_shift": sa_shift,
-                "terrain_mu": terrain_mu,
-            }
-        )
-        gt_np = _parse_chrono_rig_samples(gt)
+        for coll_enum, coll_str in _collision_type_cases():
+            with self.subTest(collision_type=coll_str):
+                gt = run_chrono_gt(
+                    {
+                        "cmd": "tire_test_rig",
+                        "mode": "test",
+                        "wheel_json": wheel_json,
+                        "tire_json": tire_json,
+                        "dt": dt,
+                        "t_end": t_end,
+                        "decimate": decimate,
+                        "grav": grav,
+                        "normal_load": normal_load,
+                        "camber": camber,
+                        "time_delay": time_delay,
+                        "collision_type": coll_str,
+                        "long_speed": long_speed,
+                        "ang_speed": ang_speed,
+                        "slip_angle_ampl": sa_ampl,
+                        "slip_angle_freq": sa_freq,
+                        "slip_angle_phase": sa_phase,
+                        "slip_angle_shift": sa_shift,
+                        "terrain_mu": terrain_mu,
+                    }
+                )
+                gt_np = _parse_chrono_rig_samples(gt)
 
-        out = _run_newton_rig(
-            tire_json=tire_json,
-            wheel_json=wheel_json,
-            mode="test",
-            collision_type=CollisionType.FOUR_POINTS,
-            dt=dt,
-            t_end=t_end,
-            decimate=decimate,
-            grav=grav,
-            normal_load=normal_load,
-            camber=camber,
-            time_delay=time_delay,
-            long_speed=long_speed,
-            ang_speed=ang_speed,
-            sa_ampl=sa_ampl,
-            sa_freq=sa_freq,
-            sa_phase=sa_phase,
-            sa_shift=sa_shift,
-            terrain_height=terrain_height,
-            terrain_mu=terrain_mu,
-            nworld=2,
-        )
+                out = _run_newton_rig(
+                    tire_json=tire_json,
+                    wheel_json=wheel_json,
+                    mode="test",
+                    collision_type=coll_enum,
+                    dt=dt,
+                    t_end=t_end,
+                    decimate=decimate,
+                    grav=grav,
+                    normal_load=normal_load,
+                    camber=camber,
+                    time_delay=time_delay,
+                    long_speed=long_speed,
+                    ang_speed=ang_speed,
+                    sa_ampl=sa_ampl,
+                    sa_freq=sa_freq,
+                    sa_phase=sa_phase,
+                    sa_shift=sa_shift,
+                    terrain_height=terrain_height,
+                    terrain_mu=terrain_mu,
+                    nworld=2,
+                )
 
-        # Compare world 0 to Chrono, ensure world 1 matches world 0 (batched).
-        _assert_allclose(self, out["t"], gt_np["t"], rtol=0.0, atol=1e-4, msg="time")
-        # Newton uses stiff PD servos to approximate Chrono's ideal motors; compare after the system reaches steady state.
-        compare_t0 = time_delay + 0.5
-        mask = gt_np["t"] >= compare_t0
-        _assert_allclose(self, out["slip"][0][mask], gt_np["slip"][mask], rtol=2e-2, atol=2e-3, msg="slip")
-        _assert_allclose(
-            self, out["slip_angle"][0][mask], gt_np["slip_angle"][mask], rtol=2e-2, atol=2e-3, msg="slip_angle"
-        )
-        _assert_allclose(
-            self, out["camber_angle"][0][mask], gt_np["camber_angle"][mask], rtol=2e-2, atol=2e-3, msg="camber_angle"
-        )
+                _save_force_moment_plots(
+                    filename=f"test_mode_generic_{coll_str}_camber{camber * 180.0 / math.pi:.1f}deg.png",
+                    t=gt_np["t"],
+                    chrono_force=gt_np["force"],
+                    chrono_moment=gt_np["moment"],
+                    newton_force=out["force"][0],
+                    newton_moment=out["moment"][0],
+                )
 
-        _assert_allclose(self, out["force"][0][mask], gt_np["force"][mask], rtol=5e-2, atol=5.0, msg="tire_force")
-        _assert_allclose(self, out["moment"][0][mask], gt_np["moment"][mask], rtol=1e-1, atol=5.0, msg="tire_moment")
+                # Compare world 0 to Chrono, ensure world 1 matches world 0 (batched).
+                _assert_allclose(self, out["t"], gt_np["t"], rtol=0.0, atol=1e-4, msg="time")
+                # Newton uses stiff PD servos to approximate Chrono's ideal motors; compare after the system reaches steady state.
+                compare_t0 = time_delay + 0.5
+                mask = gt_np["t"] >= compare_t0
+                _assert_allclose(self, out["slip"][0][mask], gt_np["slip"][mask], rtol=3.3e-3, atol=5e-4, msg="slip")
+                _assert_allclose(
+                    self, out["slip_angle"][0][mask], gt_np["slip_angle"][mask], rtol=5e-3, atol=5e-4, msg="slip_angle"
+                )
+                _assert_allclose(
+                    self,
+                    out["camber_angle"][0][mask],
+                    gt_np["camber_angle"][mask],
+                    rtol=5e-3,
+                    atol=5e-4,
+                    msg="camber_angle",
+                )
 
-        _assert_allclose(self, out["slip"][1][mask], out["slip"][0][mask], rtol=0.0, atol=1e-6, msg="slip world1")
-        _assert_allclose(
-            self, out["force"][1][mask], out["force"][0][mask], rtol=0.0, atol=1e-6, msg="force world1"
-        )
+                _assert_allclose(self, out["force"][0][mask], gt_np["force"][mask], rtol=3.1e-2, atol=2.0, msg="tire_force")
+                _assert_allclose(self, out["moment"][0][mask], gt_np["moment"][mask], rtol=3e-2, atol=1.0, msg="tire_moment")
+
+                _assert_allclose(self, out["slip"][1][mask], out["slip"][0][mask], rtol=0.0, atol=1e-6, msg="slip world1")
+                _assert_allclose(self, out["force"][1][mask], out["force"][0][mask], rtol=0.0, atol=1e-6, msg="force world1")
 
     def test_drop_mode_matches_chrono_for_nworld_2(self):
         tire_json = _chrono_data_path("vehicle/generic/tire/FialaTire.json")
@@ -643,65 +710,76 @@ class TestTireTestRig(unittest.TestCase):
         disc_radius = float(load_chrono_vehicle_json(tire_json)["Fiala Parameters"]["Unloaded Radius"])
         terrain_height = -0.4 - disc_radius - 0.1  # Chrono reference: ChTireTestRig.cpp::CreateMechanism
 
-        gt = run_chrono_gt(
-            {
-                "cmd": "tire_test_rig",
-                "mode": "drop",
-                "wheel_json": wheel_json,
-                "tire_json": tire_json,
-                "dt": dt,
-                "t_end": t_end,
-                "decimate": decimate,
-                "grav": grav,
-                "normal_load": normal_load,
-                "camber": camber,
-                "time_delay": time_delay,
-                "collision_type": "four_points",
-                "terrain_mu": terrain_mu,
-            }
-        )
-        gt_np = _parse_chrono_rig_samples(gt)
+        for coll_enum, coll_str in _collision_type_cases():
+            with self.subTest(collision_type=coll_str):
+                gt = run_chrono_gt(
+                    {
+                        "cmd": "tire_test_rig",
+                        "mode": "drop",
+                        "wheel_json": wheel_json,
+                        "tire_json": tire_json,
+                        "dt": dt,
+                        "t_end": t_end,
+                        "decimate": decimate,
+                        "grav": grav,
+                        "normal_load": normal_load,
+                        "camber": camber,
+                        "time_delay": time_delay,
+                        "collision_type": coll_str,
+                        "terrain_mu": terrain_mu,
+                    }
+                )
+                gt_np = _parse_chrono_rig_samples(gt)
 
-        out = _run_newton_rig(
-            tire_json=tire_json,
-            wheel_json=wheel_json,
-            mode="drop",
-            collision_type=CollisionType.FOUR_POINTS,
-            dt=dt,
-            t_end=t_end,
-            decimate=decimate,
-            grav=grav,
-            normal_load=normal_load,
-            camber=camber,
-            time_delay=time_delay,
-            long_speed=0.0,
-            ang_speed=0.0,
-            sa_ampl=0.0,
-            sa_freq=0.0,
-            sa_phase=0.0,
-            sa_shift=0.0,
-            terrain_height=terrain_height,
-            terrain_mu=terrain_mu,
-            nworld=2,
-        )
+                out = _run_newton_rig(
+                    tire_json=tire_json,
+                    wheel_json=wheel_json,
+                    mode="drop",
+                    collision_type=coll_enum,
+                    dt=dt,
+                    t_end=t_end,
+                    decimate=decimate,
+                    grav=grav,
+                    normal_load=normal_load,
+                    camber=camber,
+                    time_delay=time_delay,
+                    long_speed=0.0,
+                    ang_speed=0.0,
+                    sa_ampl=0.0,
+                    sa_freq=0.0,
+                    sa_phase=0.0,
+                    sa_shift=0.0,
+                    terrain_height=terrain_height,
+                    terrain_mu=terrain_mu,
+                    nworld=2,
+                )
 
-        _assert_allclose(self, out["t"], gt_np["t"], rtol=0.0, atol=1e-4, msg="time")
+                _save_force_moment_plots(
+                    filename=f"drop_mode_generic_{coll_str}_camber{camber * 180.0 / math.pi:.1f}deg.png",
+                    t=gt_np["t"],
+                    chrono_force=gt_np["force"],
+                    chrono_moment=gt_np["moment"],
+                    newton_force=out["force"][0],
+                    newton_moment=out["moment"][0],
+                )
 
-        # Compare summary vertical response metrics; expect looser agreement across engines.
-        _assert_allclose(self, out["pos"][0][:, 2], gt_np["pos"][:, 2], rtol=5e-2, atol=5e-3, msg="spindle_z")
-        self.assertLessEqual(
-            abs(float(np.min(out["pos"][0][:, 2])) - float(np.min(gt_np["pos"][:, 2]))),
-            5e-3,
-            msg="min spindle_z mismatch",
-        )
-        self.assertLessEqual(
-            abs(float(np.max(out["force"][0][:, 2])) - float(np.max(gt_np["force"][:, 2]))),
-            0.1 * float(np.max(gt_np["force"][:, 2])) + 50.0,
-            msg="peak normal_force mismatch",
-        )
+                _assert_allclose(self, out["t"], gt_np["t"], rtol=0.0, atol=1e-4, msg="time")
 
-        _assert_allclose(self, out["pos"][1][:, 2], out["pos"][0][:, 2], rtol=0.0, atol=1e-6, msg="z world1")
-        _assert_allclose(self, out["force"][1][:, 2], out["force"][0][:, 2], rtol=0.0, atol=1e-6, msg="fz world1")
+                # Compare summary vertical response metrics; expect looser agreement across engines.
+                _assert_allclose(self, out["pos"][0][:, 2], gt_np["pos"][:, 2], rtol=3.3e-2, atol=1e-3, msg="spindle_z")
+                self.assertLessEqual(
+                    abs(float(np.min(out["pos"][0][:, 2])) - float(np.min(gt_np["pos"][:, 2]))),
+                    2.3e-3,
+                    msg="min spindle_z mismatch",
+                )
+                self.assertLessEqual(
+                    abs(float(np.max(out["force"][0][:, 2])) - float(np.max(gt_np["force"][:, 2]))),
+                    0.05 * float(np.max(gt_np["force"][:, 2])) + 10.0,
+                    msg="peak normal_force mismatch",
+                )
+
+                _assert_allclose(self, out["pos"][1][:, 2], out["pos"][0][:, 2], rtol=0.0, atol=1e-6, msg="z world1")
+                _assert_allclose(self, out["force"][1][:, 2], out["force"][0][:, 2], rtol=0.0, atol=1e-6, msg="fz world1")
 
     def test_test_mode_matches_chrono_hmmwv_for_nworld_2(self):
         tire_json = _chrono_data_path("vehicle/hmmwv/tire/HMMWV_FialaTire.json")
@@ -725,59 +803,186 @@ class TestTireTestRig(unittest.TestCase):
         disc_radius = float(load_chrono_vehicle_json(tire_json)["Fiala Parameters"]["Unloaded Radius"])
         terrain_height = -0.4 - disc_radius - 0.1  # Chrono reference: ChTireTestRig.cpp::CreateMechanism
 
-        gt = run_chrono_gt(
-            {
-                "cmd": "tire_test_rig",
-                "mode": "test",
-                "wheel_json": wheel_json,
-                "tire_json": tire_json,
-                "dt": dt,
-                "t_end": t_end,
-                "decimate": decimate,
-                "grav": grav,
-                "normal_load": normal_load,
-                "camber": camber,
-                "time_delay": time_delay,
-                "collision_type": "four_points",
-                "long_speed": long_speed,
-                "ang_speed": ang_speed,
-                "slip_angle_ampl": sa_ampl,
-                "slip_angle_freq": sa_freq,
-                "slip_angle_phase": sa_phase,
-                "slip_angle_shift": sa_shift,
-                "terrain_mu": terrain_mu,
-            }
-        )
-        gt_np = _parse_chrono_rig_samples(gt)
+        for coll_enum, coll_str in _collision_type_cases():
+            with self.subTest(collision_type=coll_str):
+                gt = run_chrono_gt(
+                    {
+                        "cmd": "tire_test_rig",
+                        "mode": "test",
+                        "wheel_json": wheel_json,
+                        "tire_json": tire_json,
+                        "dt": dt,
+                        "t_end": t_end,
+                        "decimate": decimate,
+                        "grav": grav,
+                        "normal_load": normal_load,
+                        "camber": camber,
+                        "time_delay": time_delay,
+                        "collision_type": coll_str,
+                        "long_speed": long_speed,
+                        "ang_speed": ang_speed,
+                        "slip_angle_ampl": sa_ampl,
+                        "slip_angle_freq": sa_freq,
+                        "slip_angle_phase": sa_phase,
+                        "slip_angle_shift": sa_shift,
+                        "terrain_mu": terrain_mu,
+                    }
+                )
+                gt_np = _parse_chrono_rig_samples(gt)
 
-        out = _run_newton_rig(
-            tire_json=tire_json,
-            wheel_json=wheel_json,
-            mode="test",
-            collision_type=CollisionType.FOUR_POINTS,
-            dt=dt,
-            t_end=t_end,
-            decimate=decimate,
-            grav=grav,
-            normal_load=normal_load,
-            camber=camber,
-            time_delay=time_delay,
-            long_speed=long_speed,
-            ang_speed=ang_speed,
-            sa_ampl=sa_ampl,
-            sa_freq=sa_freq,
-            sa_phase=sa_phase,
-            sa_shift=sa_shift,
-            terrain_height=terrain_height,
-            terrain_mu=terrain_mu,
-            nworld=2,
-        )
+                out = _run_newton_rig(
+                    tire_json=tire_json,
+                    wheel_json=wheel_json,
+                    mode="test",
+                    collision_type=coll_enum,
+                    dt=dt,
+                    t_end=t_end,
+                    decimate=decimate,
+                    grav=grav,
+                    normal_load=normal_load,
+                    camber=camber,
+                    time_delay=time_delay,
+                    long_speed=long_speed,
+                    ang_speed=ang_speed,
+                    sa_ampl=sa_ampl,
+                    sa_freq=sa_freq,
+                    sa_phase=sa_phase,
+                    sa_shift=sa_shift,
+                    terrain_height=terrain_height,
+                    terrain_mu=terrain_mu,
+                    nworld=2,
+                )
 
-        _assert_allclose(self, out["t"], gt_np["t"], rtol=0.0, atol=1e-4, msg="time")
-        compare_t0 = time_delay + 0.5
-        mask = gt_np["t"] >= compare_t0
-        _assert_allclose(self, out["slip"][0][mask], gt_np["slip"][mask], rtol=2e-2, atol=2e-3, msg="slip")
-        _assert_allclose(self, out["force"][0][mask], gt_np["force"][mask], rtol=5e-2, atol=10.0, msg="tire_force")
-        _assert_allclose(
-            self, out["force"][1][mask], out["force"][0][mask], rtol=0.0, atol=1e-6, msg="force world1"
-        )
+                _save_force_moment_plots(
+                    filename=f"test_mode_hmmwv_{coll_str}_camber{camber * 180.0 / math.pi:.1f}deg.png",
+                    t=gt_np["t"],
+                    chrono_force=gt_np["force"],
+                    chrono_moment=gt_np["moment"],
+                    newton_force=out["force"][0],
+                    newton_moment=out["moment"][0],
+                )
+
+                _assert_allclose(self, out["t"], gt_np["t"], rtol=0.0, atol=1e-4, msg="time")
+                compare_t0 = time_delay + 0.5
+                mask = gt_np["t"] >= compare_t0
+                _assert_allclose(self, out["slip"][0][mask], gt_np["slip"][mask], rtol=3e-3, atol=5e-4, msg="slip")
+                _assert_allclose(
+                    self, out["slip_angle"][0][mask], gt_np["slip_angle"][mask], rtol=5e-3, atol=5e-4, msg="slip_angle"
+                )
+                _assert_allclose(
+                    self,
+                    out["camber_angle"][0][mask],
+                    gt_np["camber_angle"][mask],
+                    rtol=5e-3,
+                    atol=5e-4,
+                    msg="camber_angle",
+                )
+
+                _assert_allclose(self, out["force"][0][mask], gt_np["force"][mask], rtol=2e-2, atol=3.0, msg="tire_force")
+                _assert_allclose(self, out["moment"][0][mask], gt_np["moment"][mask], rtol=3e-2, atol=2.0, msg="tire_moment")
+
+                _assert_allclose(self, out["slip"][1][mask], out["slip"][0][mask], rtol=0.0, atol=1e-6, msg="slip world1")
+                _assert_allclose(self, out["force"][1][mask], out["force"][0][mask], rtol=0.0, atol=1e-6, msg="force world1")
+                _assert_allclose(self, out["moment"][1][mask], out["moment"][0][mask], rtol=0.0, atol=1e-6, msg="moment world1")
+
+    def test_test_mode_matches_chrono_with_camber_for_nworld_2(self):
+        tire_json = _chrono_data_path("vehicle/generic/tire/FialaTire.json")
+        wheel_json = _chrono_data_path("vehicle/generic/wheel/WheelSimple.json")
+
+        dt = 1e-3
+        t_end = 2.0
+        decimate = 10
+        grav = 9.8
+        normal_load = 3000.0
+        camber = 5.0 * math.pi / 180.0
+        time_delay = 1.0
+        long_speed = 0.2
+        ang_speed = 10.0 * (2.0 * math.pi / 60.0)
+        sa_ampl = 5.0 * math.pi / 180.0
+        sa_freq = 0.2
+        sa_phase = 0.0
+        sa_shift = 0.0
+        terrain_mu = 0.8
+
+        disc_radius = float(load_chrono_vehicle_json(tire_json)["Fiala Parameters"]["Unloaded Radius"])
+        terrain_height = -0.4 - disc_radius - 0.1  # Chrono reference: ChTireTestRig.cpp::CreateMechanism
+
+        for coll_enum, coll_str in _collision_type_cases():
+            with self.subTest(collision_type=coll_str):
+                gt = run_chrono_gt(
+                    {
+                        "cmd": "tire_test_rig",
+                        "mode": "test",
+                        "wheel_json": wheel_json,
+                        "tire_json": tire_json,
+                        "dt": dt,
+                        "t_end": t_end,
+                        "decimate": decimate,
+                        "grav": grav,
+                        "normal_load": normal_load,
+                        "camber": camber,
+                        "time_delay": time_delay,
+                        "collision_type": coll_str,
+                        "long_speed": long_speed,
+                        "ang_speed": ang_speed,
+                        "slip_angle_ampl": sa_ampl,
+                        "slip_angle_freq": sa_freq,
+                        "slip_angle_phase": sa_phase,
+                        "slip_angle_shift": sa_shift,
+                        "terrain_mu": terrain_mu,
+                    }
+                )
+                gt_np = _parse_chrono_rig_samples(gt)
+
+                out = _run_newton_rig(
+                    tire_json=tire_json,
+                    wheel_json=wheel_json,
+                    mode="test",
+                    collision_type=coll_enum,
+                    dt=dt,
+                    t_end=t_end,
+                    decimate=decimate,
+                    grav=grav,
+                    normal_load=normal_load,
+                    camber=camber,
+                    time_delay=time_delay,
+                    long_speed=long_speed,
+                    ang_speed=ang_speed,
+                    sa_ampl=sa_ampl,
+                    sa_freq=sa_freq,
+                    sa_phase=sa_phase,
+                    sa_shift=sa_shift,
+                    terrain_height=terrain_height,
+                    terrain_mu=terrain_mu,
+                    nworld=2,
+                )
+
+                _save_force_moment_plots(
+                    filename=f"test_mode_generic_{coll_str}_camber{camber * 180.0 / math.pi:.1f}deg.png",
+                    t=gt_np["t"],
+                    chrono_force=gt_np["force"],
+                    chrono_moment=gt_np["moment"],
+                    newton_force=out["force"][0],
+                    newton_moment=out["moment"][0],
+                )
+
+                _assert_allclose(self, out["t"], gt_np["t"], rtol=0.0, atol=1e-4, msg="time")
+                compare_t0 = time_delay + 0.5
+                mask = gt_np["t"] >= compare_t0
+                _assert_allclose(self, out["slip"][0][mask], gt_np["slip"][mask], rtol=5e-3, atol=1e-3, msg="slip")
+                _assert_allclose(
+                    self, out["slip_angle"][0][mask], gt_np["slip_angle"][mask], rtol=8e-3, atol=1e-3, msg="slip_angle"
+                )
+                _assert_allclose(
+                    self,
+                    out["camber_angle"][0][mask],
+                    gt_np["camber_angle"][mask],
+                    rtol=8e-3,
+                    atol=1e-3,
+                    msg="camber_angle",
+                )
+
+                _assert_allclose(self, out["force"][0][mask], gt_np["force"][mask], rtol=3.3e-2, atol=3.0, msg="tire_force")
+                _assert_allclose(self, out["moment"][0][mask], gt_np["moment"][mask], rtol=5e-2, atol=3.0, msg="tire_moment")
+
+                _assert_allclose(self, out["force"][1][mask], out["force"][0][mask], rtol=0.0, atol=1e-6, msg="force world1")
