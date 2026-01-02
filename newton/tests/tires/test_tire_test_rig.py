@@ -120,7 +120,8 @@ def _plot_dir() -> Path:
 def _save_force_moment_plots(
     *,
     filename: str,
-    t: np.ndarray,
+    x: np.ndarray,
+    xlabel: str,
     chrono_force: np.ndarray,
     chrono_moment: np.ndarray,
     newton_force: np.ndarray,
@@ -144,14 +145,16 @@ def _save_force_moment_plots(
     ]
 
     for a, title, ylabel, y_chrono, y_newton in panels:
-        a.plot(t, y_chrono, linestyle="--", marker="o", markersize=3.0, linewidth=1.2, label="Chrono")
-        a.plot(t, y_newton, linestyle="-", marker="s", markersize=3.0, linewidth=1.2, label="Newton")
+        a.plot(x, y_chrono, linestyle="--", marker="o", markersize=3.0, linewidth=1.2, label="Chrono")
+        a.plot(x, y_newton, linestyle="-", marker="s", markersize=3.0, linewidth=1.2, label="Newton")
         a.set_title(title, fontsize=10)
         a.set_ylabel(ylabel)
         a.legend(fontsize=8)
+        a.grid(True, alpha=0.25)
+        a.ticklabel_format(axis="y", style="plain", useOffset=False)
 
-    ax[2, 0].set_xlabel("Time (s)")
-    ax[2, 1].set_xlabel("Time (s)")
+    ax[2, 0].set_xlabel(xlabel)
+    ax[2, 1].set_xlabel(xlabel)
     fig.tight_layout()
     fig.savefig(out_path, dpi=150)
     plt.close(fig)
@@ -661,13 +664,15 @@ class TestTireTestRig(unittest.TestCase):
                     nworld=2,
                 )
 
+                time_plot_mask = gt_np["t"] >= time_delay
                 _save_force_moment_plots(
                     filename=f"test_mode_generic_{coll_str}_camber{camber * 180.0 / math.pi:.1f}deg.png",
-                    t=gt_np["t"],
-                    chrono_force=gt_np["force"],
-                    chrono_moment=gt_np["moment"],
-                    newton_force=out["force"][0],
-                    newton_moment=out["moment"][0],
+                    x=gt_np["t"][time_plot_mask],
+                    xlabel="Time (s)",
+                    chrono_force=gt_np["force"][time_plot_mask],
+                    chrono_moment=gt_np["moment"][time_plot_mask],
+                    newton_force=out["force"][0][time_plot_mask],
+                    newton_moment=out["moment"][0][time_plot_mask],
                 )
 
                 # Compare world 0 to Chrono, ensure world 1 matches world 0 (batched).
@@ -690,6 +695,38 @@ class TestTireTestRig(unittest.TestCase):
 
                 _assert_allclose(self, out["force"][0][mask], gt_np["force"][mask], rtol=3.1e-2, atol=2.0, msg="tire_force")
                 _assert_allclose(self, out["moment"][0][mask], gt_np["moment"][mask], rtol=3e-2, atol=1.0, msg="tire_moment")
+
+                # Force/moment curves against slip angle (report-style).
+                sa_plot_mask = gt_np["t"] >= time_delay
+                sa_plot_deg = gt_np["slip_angle"][sa_plot_mask] * (180.0 / math.pi)
+                sa_plot_order = np.argsort(sa_plot_deg)
+                _save_force_moment_plots(
+                    filename=f"test_mode_generic_{coll_str}_camber{camber * 180.0 / math.pi:.1f}deg_vs_slip_angle.png",
+                    x=sa_plot_deg[sa_plot_order],
+                    xlabel="Slip Angle (deg)",
+                    chrono_force=gt_np["force"][sa_plot_mask][sa_plot_order],
+                    chrono_moment=gt_np["moment"][sa_plot_mask][sa_plot_order],
+                    newton_force=out["force"][0][sa_plot_mask][sa_plot_order],
+                    newton_moment=out["moment"][0][sa_plot_mask][sa_plot_order],
+                )
+                slip_deg = gt_np["slip_angle"][mask] * (180.0 / math.pi)
+                order = np.argsort(slip_deg)
+                _assert_allclose(
+                    self,
+                    out["force"][0][mask][order],
+                    gt_np["force"][mask][order],
+                    rtol=3.1e-2,
+                    atol=2.0,
+                    msg="tire_force vs slip_angle",
+                )
+                _assert_allclose(
+                    self,
+                    out["moment"][0][mask][order],
+                    gt_np["moment"][mask][order],
+                    rtol=3e-2,
+                    atol=1.0,
+                    msg="tire_moment vs slip_angle",
+                )
 
                 _assert_allclose(self, out["slip"][1][mask], out["slip"][0][mask], rtol=0.0, atol=1e-6, msg="slip world1")
                 _assert_allclose(self, out["force"][1][mask], out["force"][0][mask], rtol=0.0, atol=1e-6, msg="force world1")
@@ -756,7 +793,8 @@ class TestTireTestRig(unittest.TestCase):
 
                 _save_force_moment_plots(
                     filename=f"drop_mode_generic_{coll_str}_camber{camber * 180.0 / math.pi:.1f}deg.png",
-                    t=gt_np["t"],
+                    x=gt_np["t"],
+                    xlabel="Time (s)",
                     chrono_force=gt_np["force"],
                     chrono_moment=gt_np["moment"],
                     newton_force=out["force"][0],
@@ -853,13 +891,15 @@ class TestTireTestRig(unittest.TestCase):
                     nworld=2,
                 )
 
+                plot_mask = gt_np["t"] >= time_delay
                 _save_force_moment_plots(
                     filename=f"test_mode_hmmwv_{coll_str}_camber{camber * 180.0 / math.pi:.1f}deg.png",
-                    t=gt_np["t"],
-                    chrono_force=gt_np["force"],
-                    chrono_moment=gt_np["moment"],
-                    newton_force=out["force"][0],
-                    newton_moment=out["moment"][0],
+                    x=gt_np["t"][plot_mask],
+                    xlabel="Time (s)",
+                    chrono_force=gt_np["force"][plot_mask],
+                    chrono_moment=gt_np["moment"][plot_mask],
+                    newton_force=out["force"][0][plot_mask],
+                    newton_moment=out["moment"][0][plot_mask],
                 )
 
                 _assert_allclose(self, out["t"], gt_np["t"], rtol=0.0, atol=1e-4, msg="time")
@@ -880,6 +920,38 @@ class TestTireTestRig(unittest.TestCase):
 
                 _assert_allclose(self, out["force"][0][mask], gt_np["force"][mask], rtol=2e-2, atol=3.0, msg="tire_force")
                 _assert_allclose(self, out["moment"][0][mask], gt_np["moment"][mask], rtol=3e-2, atol=2.0, msg="tire_moment")
+
+                # Force/moment curves against slip angle (report-style).
+                sa_plot_mask = gt_np["t"] >= time_delay
+                sa_plot_deg = gt_np["slip_angle"][sa_plot_mask] * (180.0 / math.pi)
+                sa_plot_order = np.argsort(sa_plot_deg)
+                _save_force_moment_plots(
+                    filename=f"test_mode_hmmwv_{coll_str}_camber{camber * 180.0 / math.pi:.1f}deg_vs_slip_angle.png",
+                    x=sa_plot_deg[sa_plot_order],
+                    xlabel="Slip Angle (deg)",
+                    chrono_force=gt_np["force"][sa_plot_mask][sa_plot_order],
+                    chrono_moment=gt_np["moment"][sa_plot_mask][sa_plot_order],
+                    newton_force=out["force"][0][sa_plot_mask][sa_plot_order],
+                    newton_moment=out["moment"][0][sa_plot_mask][sa_plot_order],
+                )
+                slip_deg = gt_np["slip_angle"][mask] * (180.0 / math.pi)
+                order = np.argsort(slip_deg)
+                _assert_allclose(
+                    self,
+                    out["force"][0][mask][order],
+                    gt_np["force"][mask][order],
+                    rtol=2e-2,
+                    atol=3.0,
+                    msg="tire_force vs slip_angle",
+                )
+                _assert_allclose(
+                    self,
+                    out["moment"][0][mask][order],
+                    gt_np["moment"][mask][order],
+                    rtol=3e-2,
+                    atol=2.0,
+                    msg="tire_moment vs slip_angle",
+                )
 
                 _assert_allclose(self, out["slip"][1][mask], out["slip"][0][mask], rtol=0.0, atol=1e-6, msg="slip world1")
                 _assert_allclose(self, out["force"][1][mask], out["force"][0][mask], rtol=0.0, atol=1e-6, msg="force world1")
@@ -957,13 +1029,15 @@ class TestTireTestRig(unittest.TestCase):
                     nworld=2,
                 )
 
+                plot_mask = gt_np["t"] >= time_delay
                 _save_force_moment_plots(
                     filename=f"test_mode_generic_{coll_str}_camber{camber * 180.0 / math.pi:.1f}deg.png",
-                    t=gt_np["t"],
-                    chrono_force=gt_np["force"],
-                    chrono_moment=gt_np["moment"],
-                    newton_force=out["force"][0],
-                    newton_moment=out["moment"][0],
+                    x=gt_np["t"][plot_mask],
+                    xlabel="Time (s)",
+                    chrono_force=gt_np["force"][plot_mask],
+                    chrono_moment=gt_np["moment"][plot_mask],
+                    newton_force=out["force"][0][plot_mask],
+                    newton_moment=out["moment"][0][plot_mask],
                 )
 
                 _assert_allclose(self, out["t"], gt_np["t"], rtol=0.0, atol=1e-4, msg="time")
@@ -984,5 +1058,37 @@ class TestTireTestRig(unittest.TestCase):
 
                 _assert_allclose(self, out["force"][0][mask], gt_np["force"][mask], rtol=3.3e-2, atol=3.0, msg="tire_force")
                 _assert_allclose(self, out["moment"][0][mask], gt_np["moment"][mask], rtol=5e-2, atol=3.0, msg="tire_moment")
+
+                # Force/moment curves against slip angle (report-style).
+                sa_plot_mask = gt_np["t"] >= time_delay
+                sa_plot_deg = gt_np["slip_angle"][sa_plot_mask] * (180.0 / math.pi)
+                sa_plot_order = np.argsort(sa_plot_deg)
+                _save_force_moment_plots(
+                    filename=f"test_mode_generic_{coll_str}_camber{camber * 180.0 / math.pi:.1f}deg_vs_slip_angle.png",
+                    x=sa_plot_deg[sa_plot_order],
+                    xlabel="Slip Angle (deg)",
+                    chrono_force=gt_np["force"][sa_plot_mask][sa_plot_order],
+                    chrono_moment=gt_np["moment"][sa_plot_mask][sa_plot_order],
+                    newton_force=out["force"][0][sa_plot_mask][sa_plot_order],
+                    newton_moment=out["moment"][0][sa_plot_mask][sa_plot_order],
+                )
+                slip_deg = gt_np["slip_angle"][mask] * (180.0 / math.pi)
+                order = np.argsort(slip_deg)
+                _assert_allclose(
+                    self,
+                    out["force"][0][mask][order],
+                    gt_np["force"][mask][order],
+                    rtol=3.3e-2,
+                    atol=3.0,
+                    msg="tire_force vs slip_angle",
+                )
+                _assert_allclose(
+                    self,
+                    out["moment"][0][mask][order],
+                    gt_np["moment"][mask][order],
+                    rtol=5e-2,
+                    atol=3.0,
+                    msg="tire_moment vs slip_angle",
+                )
 
                 _assert_allclose(self, out["force"][1][mask], out["force"][0][mask], rtol=0.0, atol=1e-6, msg="force world1")

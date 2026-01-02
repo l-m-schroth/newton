@@ -16,6 +16,7 @@
 
 #include "chrono/core/ChTypes.h"
 #include "chrono/physics/ChSystemNSC.h"
+#include "chrono/solver/ChIterativeSolverVI.h"
 
 #include "chrono/functions/ChFunctionConst.h"
 #include "chrono/functions/ChFunctionSine.h"
@@ -35,6 +36,25 @@
 namespace rj = rapidjson;
 
 namespace {
+
+void ConfigureChronoTireTestRigSystem(chrono::ChSystemNSC& sys) {
+    // Chrono reference:
+    // - chrono/src/demos/vehicle/test_rigs/demo_VEH_TireTestRig.cpp (NSC default solver/integrator configuration)
+    // - chrono/src/demos/SetChronoSolver.h::SetChronoSolver (BB solver parameters)
+    //
+    // Rationale: the tire test rig is sensitive to constraint drift during the settling phase. The Chrono demo sets an
+    // iterative VI solver (BARZILAIBORWEIN) and EULER_IMPLICIT_LINEARIZED integrator. We mirror those settings here so
+    // the ground-truth behavior matches the Chrono reference demo more closely.
+
+    sys.SetSolverType(chrono::ChSolver::Type::BARZILAIBORWEIN);
+    if (auto solver = std::dynamic_pointer_cast<chrono::ChIterativeSolverVI>(sys.GetSolver())) {
+        solver->SetMaxIterations(100);
+        solver->SetOmega(0.8);
+        solver->SetSharpnessLambda(1.0);
+    }
+
+    sys.SetTimestepperType(chrono::ChTimestepper::Type::EULER_IMPLICIT_LINEARIZED);
+}
 
 std::string ReadAllStdin() {
     std::ostringstream ss;
@@ -742,6 +762,7 @@ int main(int argc, char** argv) {
             }
 
             chrono::ChSystemNSC sys;
+            ConfigureChronoTireTestRigSystem(sys);
             chrono::vehicle::ChTireTestRig rig(wheel, tire, &sys);
 
             rig.SetGravitationalAcceleration(grav);
