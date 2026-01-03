@@ -234,7 +234,7 @@ def _build_newton_rig_model(
     inertia_wt = [wheel_inertia[i] + tire_inertia[i] for i in range(3)]
 
     total_mass = normal_load / grav if grav > 0.0 else 0.0
-    other_mass = 2.0 * mass_wt  # slip + spindle (carrier does not contribute to normal load)
+    other_mass = 2.0 * mass_wt  # slip + spindle (carrier does not contribute to normal load in this MuJoCo mechanism)
     chassis_mass_target = total_mass - other_mass
     chassis_mass = chassis_mass_target if chassis_mass_target > mass_wt else mass_wt
 
@@ -343,19 +343,30 @@ def _build_newton_rig_model(
         # In Chrono, the slip body is connected through a lock joint. In Mode::TEST, the lock imposes a prescribed
         # rotation about +Z (slip angle). In DROP mode, this stays at 0 (no actuation, no lateral excitation).
         slip_limits = (None, None)
-        j_slip = b.add_joint_revolute(
-            chassis,
-            slip,
-            axis=(0.0, 0.0, 1.0),
-            parent_xform=joint_p,
-            child_xform=joint_c,
-            target_ke=slip_kp,
-            target_kd=slip_kd,
-            limit_lower=slip_limits[0],
-            limit_upper=slip_limits[1],
-            armature=0.0,
-            key="slip_yaw",
-        )
+        if mode == "test":
+            j_slip = b.add_joint_revolute(
+                chassis,
+                slip,
+                axis=(0.0, 0.0, 1.0),
+                parent_xform=joint_p,
+                child_xform=joint_c,
+                target_ke=slip_kp,
+                target_kd=slip_kd,
+                limit_lower=slip_limits[0],
+                limit_upper=slip_limits[1],
+                armature=0.0,
+                key="slip_yaw",
+            )
+        else:
+            # Chrono reference: chrono/src/chrono_vehicle/wheeled_vehicle/test_rig/ChTireTestRig.cpp::CreateMechanism
+            # In DROP mode, the chassis-to-slip connection is a lock joint (no relative yaw).
+            j_slip = b.add_joint_fixed(
+                chassis,
+                slip,
+                parent_xform=joint_p,
+                child_xform=joint_c,
+                key="slip_yaw",
+            )
         # NOTE (Lukas): with zero camber wheel spin is around Y-axis. 
         wheel_axis = (0.0, math.cos(camber), -math.sin(camber))
         j_wheel = b.add_joint_revolute(
@@ -378,12 +389,34 @@ def _build_newton_rig_model(
         main.add_world(world_builder)
 
     model = main.finalize()
-    axes = {
-        "carrier_x": 0,
-        "chassis_z": 1,
-        "slip_yaw": 2,
-        "wheel_spin": 3,
-    }
+
+    # Resolve per-world DOF indices from joint keys (handles DROP mode where `slip_yaw` is fixed).
+    joint_world = model.joint_world.numpy()
+    joint_qd_start = model.joint_qd_start.numpy()
+    joint_dof_dim = model.joint_dof_dim.numpy()
+
+    world0_joints = np.nonzero(joint_world == 0)[0]
+    if world0_joints.size == 0:
+        raise RuntimeError("No joints found for world 0; cannot resolve rig DOF indices.")
+
+    world0_dof_starts = [int(joint_qd_start[j]) for j in world0_joints if int(joint_dof_dim[j, 0] + joint_dof_dim[j, 1]) > 0]
+    if not world0_dof_starts:
+        raise RuntimeError("World 0 contains no DOFs; cannot resolve rig DOF indices.")
+    dof_base = min(world0_dof_starts)
+
+    key_to_joint = {model.joint_key[int(j)]: int(j) for j in world0_joints}
+
+    def _dof_idx_for_key(key: str) -> int:
+        if key not in key_to_joint:
+            raise RuntimeError(f"Rig joint key not found in world 0: {key}")
+        j = key_to_joint[key]
+        dof_dim = int(joint_dof_dim[j, 0] + joint_dof_dim[j, 1])
+        if dof_dim == 0:
+            return -1
+        return int(joint_qd_start[j] - dof_base)
+
+    dof_per_world = int(model.joint_dof_count) // int(nworld)
+    axes = {"carrier_x": _dof_idx_for_key("carrier_x"), "chassis_z": _dof_idx_for_key("chassis_z"), "slip_yaw": _dof_idx_for_key("slip_yaw"), "wheel_spin": _dof_idx_for_key("wheel_spin")}
     return model, axes
 
 
@@ -409,6 +442,7 @@ def _run_newton_rig(
     terrain_height: float,
     terrain_mu: float,
     nworld: int,
+    init_long_speed: float = 0.0,
 ) -> dict[str, np.ndarray]:
     model, axes = _build_newton_rig_model(
         tire_json=tire_json,
@@ -423,11 +457,18 @@ def _run_newton_rig(
     )
 
     state_0, state_1 = model.state(), model.state()
+    if init_long_speed != 0.0:
+        dof_per_world = model.joint_dof_count // nworld
+        joint_qd = state_0.joint_qd.numpy()
+        for w in range(nworld):
+            joint_qd[w * dof_per_world + axes["carrier_x"]] = float(init_long_speed)
+        state_0.joint_qd.assign(joint_qd)
+        state_1.assign(state_0)
     control = model.control()
     # Call Newton collision once only to get the container for stepping, we use Mujoco colission + tire module later. 
     contacts = model.collide(state_0)
 
-    solver = SolverMuJoCo(model, use_mujoco_contacts=True)
+    solver = SolverMuJoCo(model, use_mujoco_contacts=True, solver="newton", iterations=50, ls_iterations=20)
 
     terrain_geom_name = None
     for gid in range(int(solver.mj_model.ngeom)):
@@ -536,8 +577,8 @@ def _run_newton_rig(
             # MuJoCo `cvel` is com-based spatial velocity, expressed at the subtree COM of the kinematic tree root.
             # Convert to world linear velocity at the wheel center (Chrono spindle velocity).
             cvel = cvel_arr[w, wheel_id, :]
-            omega_world = cvel[0:3]
             vel_com = cvel[3:6]
+            omega_world = cvel[0:3]
             rootid = int(body_rootid[wheel_id])
             dif = xipos[w, wheel_id, :] - subtree_com[w, rootid, :]
             vel_world = vel_com - np.cross(dif, omega_world)
@@ -596,9 +637,9 @@ class TestTireTestRig(unittest.TestCase):
         tire_json = _chrono_data_path("vehicle/generic/tire/FialaTire.json")
         wheel_json = _chrono_data_path("vehicle/generic/wheel/WheelSimple.json")
 
-        dt = 1e-3 # chrono demo uses 2e-4 for NSG
+        dt = 5e-4  # chrono demo uses 2e-4 for NSG
         t_end = 2.0
-        decimate = 10
+        decimate = 20
         grav = 9.8
         normal_load = 3000.0
         camber = 0.0
@@ -696,7 +737,7 @@ class TestTireTestRig(unittest.TestCase):
                 _assert_allclose(self, out["force"][0][mask], gt_np["force"][mask], rtol=3.1e-2, atol=2.0, msg="tire_force")
                 _assert_allclose(self, out["moment"][0][mask], gt_np["moment"][mask], rtol=3e-2, atol=1.0, msg="tire_moment")
 
-                # Force/moment curves against slip angle (report-style). # NOTE (Lukas): Is this really sensible? Force is not only influenced by slip angle, but also normal force etc. 
+                # Force/moment curves against slip angle (report-style). # NOTE (Lukas): Is this really sensible? Force is not only influenced by slip angle, but also normal force etc.
                 sa_plot_mask = gt_np["t"] >= time_delay
                 sa_plot_deg = gt_np["slip_angle"][sa_plot_mask] * (180.0 / math.pi)
                 sa_plot_order = np.argsort(sa_plot_deg)
@@ -735,9 +776,9 @@ class TestTireTestRig(unittest.TestCase):
         tire_json = _chrono_data_path("vehicle/generic/tire/FialaTire.json")
         wheel_json = _chrono_data_path("vehicle/generic/wheel/WheelSimple.json")
 
-        dt = 1e-3
+        dt = 5e-4
         t_end = 1.0
-        decimate = 10
+        decimate = 20
         grav = 9.8
         normal_load = 3000.0
         camber = 0.0
@@ -789,6 +830,10 @@ class TestTireTestRig(unittest.TestCase):
                     terrain_height=terrain_height,
                     terrain_mu=terrain_mu,
                     nworld=2,
+                    # Chrono's Fiala slip computation is ill-conditioned at vx≈0 and (due to floating-point noise)
+                    # produces non-zero Fx/My even for a nominally vertical drop from rest. MuJoCo keeps vx exactly 0.
+                    # Seed a tiny initial carrier speed to get comparable low-speed behavior.
+                    init_long_speed=-1e-8,
                 )
 
                 _save_force_moment_plots(
@@ -823,9 +868,9 @@ class TestTireTestRig(unittest.TestCase):
         tire_json = _chrono_data_path("vehicle/hmmwv/tire/HMMWV_FialaTire.json")
         wheel_json = _chrono_data_path("vehicle/hmmwv/wheel/HMMWV_Wheel.json")
 
-        dt = 1e-3
+        dt = 5e-4
         t_end = 2.0
-        decimate = 10
+        decimate = 20
         grav = 9.8
         normal_load = 3000.0
         camber = 0.0
@@ -961,9 +1006,9 @@ class TestTireTestRig(unittest.TestCase):
         tire_json = _chrono_data_path("vehicle/generic/tire/FialaTire.json")
         wheel_json = _chrono_data_path("vehicle/generic/wheel/WheelSimple.json")
 
-        dt = 1e-3
+        dt = 5e-4
         t_end = 2.0
-        decimate = 10
+        decimate = 20
         grav = 9.8
         normal_load = 3000.0
         camber = 5.0 * math.pi / 180.0

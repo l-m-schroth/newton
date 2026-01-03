@@ -61,13 +61,13 @@ def _mujoco_tire_contact_kinematics_kernel(
 
     w = cvel[worldid, bodyid]  # (ang:lin) in world
     omega_world = wp.vec3(w[0], w[1], w[2])
-    # MuJoCo stores `cvel` as com-based spatial velocity, expressed at the subtree COM of the kinematic tree root.
+    # MuJoCo stores `cvel` as com-based spatial velocity expressed at the subtree COM of the kinematic tree root
+    # (see `mujoco/src/engine/engine_core_smooth.c::mj_comPos` / `mj_comVel`).
     # Convert to the world linear velocity at the wheel center (disc center).
-    # NOTE (Lukas): Reference: mujoco/src/engine/engine_core_smooth.c::mj_comPos
     rootid = body_rootid[bodyid]
     dif = xipos[worldid, bodyid] - subtree_com[worldid, rootid]
-    vel_com = wp.vec3(w[3], w[4], w[5])
-    vel_world = vel_com - wp.cross(dif, omega_world)
+    vel_ref = wp.vec3(w[3], w[4], w[5])
+    vel_world = vel_ref - wp.cross(dif, omega_world)
 
     cx = contact_x[tid]
     cy = contact_y[tid]
