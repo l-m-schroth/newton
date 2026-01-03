@@ -696,7 +696,7 @@ class TestTireTestRig(unittest.TestCase):
                 _assert_allclose(self, out["force"][0][mask], gt_np["force"][mask], rtol=3.1e-2, atol=2.0, msg="tire_force")
                 _assert_allclose(self, out["moment"][0][mask], gt_np["moment"][mask], rtol=3e-2, atol=1.0, msg="tire_moment")
 
-                # Force/moment curves against slip angle (report-style).
+                # Force/moment curves against slip angle (report-style). # NOTE (Lukas): Is this really sensible? Force is not only influenced by slip angle, but also normal force etc. 
                 sa_plot_mask = gt_np["t"] >= time_delay
                 sa_plot_deg = gt_np["slip_angle"][sa_plot_mask] * (180.0 / math.pi)
                 sa_plot_order = np.argsort(sa_plot_deg)
