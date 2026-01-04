@@ -1,0 +1,134 @@
+% Substep 5 documentation (Chrono TireTestRig reproduction in Newton)
+%
+% This file documents the implementation work done in substep 5 of the tire-model
+% porting plan: reproducing Chrono's TireTestRig demo behavior in Newton + MuJoCo-Warp
+% using the Chrono-like tire pipeline (substeps 2--4) and validating against Chrono
+% ground truth.
+%
+\section{Substep 5: TireTestRig Reproduction (Chrono vs Newton/MuJoCo-Warp)}
+\label{sec:substep5-tire-test-rig}
+
+\subsection{Goal}
+The goal of this substep is to reproduce Chrono's \texttt{ChTireTestRig} behavior in Newton using the MuJoCo-Warp backend:
+\begin{itemize}
+  \item run the same rig ``modes'' as Chrono (drop and test),
+  \item validate Newton outputs against Chrono ground truth (within sensible numerical tolerances),
+  \item ensure the implementation works for \texttt{nworld=2} (warp-batched / vectorized usage).
+\end{itemize}
+Chrono remains the ground-truth oracle; Chrono code must not be modified to make tests pass.
+
+\subsection{Chrono Reference}
+Chrono reference implementation files:
+\begin{itemize}
+  \item \texttt{chrono/src/chrono\_vehicle/wheeled\_vehicle/test\_rig/ChTireTestRig.cpp}
+  \item \texttt{chrono/src/demos/vehicle/test\_rigs/demo\_VEH\_TireTestRig.cpp}
+\end{itemize}
+
+Chrono ground truth is accessed via the existing CLI oracle introduced in substep~0:
+\begin{itemize}
+  \item \texttt{newton/newton/tests/tires/chrono\_gt/newton\_chrono\_gt.cpp} (command \texttt{"tire\_test\_rig"})
+  \item \texttt{newton/newton/tests/tires/chrono\_gt.py} (Python helper \texttt{run\_chrono\_gt})
+\end{itemize}
+
+\paragraph{Chrono oracle command: \texttt{"tire\_test\_rig"}}
+The ground-truth executable constructs a Chrono \texttt{ChSystemNSC}, configures it similarly to the demo, instantiates
+\texttt{chrono::vehicle::ChTireTestRig}, and advances it for \texttt{t\_end} with step size \texttt{dt}.
+Every \texttt{decimate} steps it records samples:
+\begin{itemize}
+  \item \textbf{rig outputs:} \texttt{slip}, \texttt{slip\_angle}, \texttt{camber\_angle},
+  \item \textbf{tire wrench:} \texttt{ReportTireForce().force/moment/point},
+  \item \textbf{spindle state:} \texttt{pos}, \texttt{vel}, and \texttt{omega\_local} (spindle angular velocity in the wheel frame).
+\end{itemize}
+The request selects:
+\begin{itemize}
+  \item rig \texttt{mode} in \{ \texttt{"drop"}, \texttt{"test"} \},
+  \item collision type \{ \texttt{"single\_point"}, \texttt{"four\_points"}, \texttt{"envelope"} \},
+  \item wheel/tire JSONs and parameters (gravity, normal load, camber, time delay, prescribed speeds in test mode).
+\end{itemize}
+
+\subsection{Newton Reproduction Test}
+Primary test file:
+\begin{itemize}
+  \item \texttt{newton/newton/tests/tires/test\_tire\_test\_rig.py}
+\end{itemize}
+
+\subsubsection{High-level structure}
+For each collision mode (\texttt{single\_point}, \texttt{four\_points}, \texttt{envelope}) the test:
+\begin{enumerate}
+  \item runs Chrono ground truth (\texttt{run\_chrono\_gt} with \texttt{cmd="tire\_test\_rig"}), parses samples into dense arrays,
+  \item runs a Newton+MuJoCo-Warp rig implementation with the same inputs,
+  \item compares selected output signals and enforces \texttt{nworld=2} batch consistency.
+\end{enumerate}
+
+\subsubsection{Newton rig implementation notes}
+The Newton side is a minimal mechanism model built specifically for the rig comparison and stepped with \texttt{SolverMuJoCo}.
+Key aspects (as implemented in \texttt{test\_tire\_test\_rig.py}):
+\begin{itemize}
+  \item \textbf{Tire forces via callback:}
+    tire forces are computed by \texttt{MujocoFialaTireModule} (substep~4) inside MuJoCo-Warp's control callback and written to
+    \texttt{xfrc\_applied}, i.e.\ the wheel--terrain interaction is handled explicitly (Chrono-style).
+  \item \textbf{Wheel--terrain contacts disabled:}
+    wheel collisions are disabled for the wheel bodies managed by the tire module, so MuJoCo's contact solver does not compute
+    wheel contact forces.
+  \item \textbf{Prescribed motions in test mode:}
+    Chrono uses ideal motion functions for longitudinal speed, wheel spin, and slip-angle oscillation. Newton approximates these
+    through joint target position/velocity controls (stiff PD servo behavior).
+  \item \textbf{Slip-angle sign convention:}
+    the rig applies a sign correction for the slip yaw joint to match Chrono's reported slip angle.
+  \item \textbf{Sampling:}
+    after stepping, \texttt{mujoco\_warp.forward} is called to ensure derived MuJoCo fields (e.g.\ \texttt{xipos}, \texttt{xmat}, \texttt{cvel})
+    and \texttt{xfrc\_applied} are consistent at the sampled state.
+\end{itemize}
+
+\subsubsection{Quantities compared}
+The test compares Newton vs Chrono using both time-series and ``report-style'' checks:
+\begin{itemize}
+  \item \textbf{Test mode:}
+    compares \texttt{slip}, \texttt{slip\_angle}, \texttt{camber\_angle}, and the tire force/moment time series after a settle window
+    (Chrono time delay plus additional settling time) to reduce sensitivity to transient differences between engines.
+  \item \textbf{Drop mode:}
+    compares summary vertical response metrics (spindle $z$ trajectory statistics and peak normal force), using looser tolerances.
+  \item \textbf{Batching:}
+    asserts that world~1 matches world~0 for key outputs (e.g.\ slip/forces) to validate \texttt{nworld=2} correctness.
+\end{itemize}
+
+\paragraph{Numerical notes}
+Two numerical details are explicitly handled in the test:
+\begin{itemize}
+  \item \textbf{Low-speed slip conditioning:}
+    Chrono's Fiala slip computation is ill-conditioned at $v_x \approx 0$ and can produce non-zero longitudinal forces/moments due
+    to tiny floating-point noise. MuJoCo can keep $v_x$ exactly zero in a nominal drop-from-rest. The drop-mode test therefore seeds a
+    tiny initial carrier speed to make the low-speed behavior comparable.
+  \item \textbf{Tolerance selection:}
+    tolerances are chosen to be slightly above observed maximum discrepancies in the CPU test environment (float32 vs float64,
+    solver/integrator differences, and accumulation over time). The intent is to avoid brittle tests while still flagging regressions.
+\end{itemize}
+
+\subsection{Plots (Debug/Review Artifacts)}
+The test produces plots under:
+\begin{itemize}
+  \item \texttt{newton/newton/tests/tires/tire\_rig\_plots/}
+\end{itemize}
+
+Two families of plots are generated:
+\begin{itemize}
+  \item \textbf{Time-series plots:} a $5\times2$ grid showing tire forces/moments and key rig degrees of freedom over time:
+    carrier $x$, chassis $z$, slip yaw angle (deg), and wheel spin $\omega$.
+  \item \textbf{Slip-angle ``report'' plots:} force/moment curves versus slip angle (using a time-delay mask to match the Chrono rig definition).
+\end{itemize}
+These plots are intended for qualitative inspection and debugging; the unit tests enforce quantitative comparisons.
+
+\subsection{Running the Tests}
+From the \texttt{newton} repository root:
+\begin{verbatim}
+# Optional: keep Warp cache inside the repo
+export WARP_CACHE_PATH="$(pwd)/.warp_cache"
+
+# If CUDA is not available in the environment, force CPU
+export WARP_DISABLE_CUDA=1
+
+./.venv/bin/python -m unittest -v newton.tests.tires.test_tire_test_rig
+\end{verbatim}
+
+If the Chrono oracle binary is not available, first build it as described in
+\texttt{newton/newton/tests/tires/doc\_substep0\_chrono\_ground\_truth.tex}.
