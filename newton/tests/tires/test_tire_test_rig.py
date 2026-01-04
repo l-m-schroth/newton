@@ -343,19 +343,30 @@ def _build_newton_rig_model(
         # In Chrono, the slip body is connected through a lock joint. In Mode::TEST, the lock imposes a prescribed
         # rotation about +Z (slip angle). In DROP mode, this stays at 0 (no actuation, no lateral excitation).
         slip_limits = (None, None)
-        j_slip = b.add_joint_revolute(
-            chassis,
-            slip,
-            axis=(0.0, 0.0, 1.0),
-            parent_xform=joint_p,
-            child_xform=joint_c,
-            target_ke=slip_kp,
-            target_kd=slip_kd,
-            limit_lower=slip_limits[0],
-            limit_upper=slip_limits[1],
-            armature=0.0,
-            key="slip_yaw",
-        )
+        if mode == "test":
+            j_slip = b.add_joint_revolute(
+                chassis,
+                slip,
+                axis=(0.0, 0.0, 1.0),
+                parent_xform=joint_p,
+                child_xform=joint_c,
+                target_ke=slip_kp,
+                target_kd=slip_kd,
+                limit_lower=slip_limits[0],
+                limit_upper=slip_limits[1],
+                armature=0.0,
+                key="slip_yaw",
+            )
+        else:
+            # Chrono reference: chrono/src/chrono_vehicle/wheeled_vehicle/test_rig/ChTireTestRig.cpp::CreateMechanism
+            # In DROP mode, the chassis-to-slip connection is a lock joint (no relative yaw).
+            j_slip = b.add_joint_fixed(
+                chassis,
+                slip,
+                parent_xform=joint_p,
+                child_xform=joint_c,
+                key="slip_yaw",
+            )
         # NOTE (Lukas): with zero camber wheel spin is around Y-axis. 
         wheel_axis = (0.0, math.cos(camber), -math.sin(camber))
         j_wheel = b.add_joint_revolute(
@@ -378,12 +389,33 @@ def _build_newton_rig_model(
         main.add_world(world_builder)
 
     model = main.finalize()
-    axes = {
-        "carrier_x": 0,
-        "chassis_z": 1,
-        "slip_yaw": 2,
-        "wheel_spin": 3,
-    }
+    # Resolve per-world DOF indices from joint keys (handles DROP mode where `slip_yaw` is fixed).
+    joint_world = model.joint_world.numpy()
+    joint_qd_start = model.joint_qd_start.numpy()
+    joint_dof_dim = model.joint_dof_dim.numpy()
+
+    world0_joints = np.nonzero(joint_world == 0)[0]
+    if world0_joints.size == 0:
+        raise RuntimeError("No joints found for world 0; cannot resolve rig DOF indices.")
+
+    world0_dof_starts = [int(joint_qd_start[j]) for j in world0_joints if int(joint_dof_dim[j, 0] + joint_dof_dim[j, 1]) > 0]
+    if not world0_dof_starts:
+        raise RuntimeError("World 0 contains no DOFs; cannot resolve rig DOF indices.")
+    dof_base = min(world0_dof_starts)
+
+    key_to_joint = {model.joint_key[int(j)]: int(j) for j in world0_joints}
+
+    def _dof_idx_for_key(key: str) -> int:
+        if key not in key_to_joint:
+            raise RuntimeError(f"Rig joint key not found in world 0: {key}")
+        j = key_to_joint[key]
+        dof_dim = int(joint_dof_dim[j, 0] + joint_dof_dim[j, 1])
+        if dof_dim == 0:
+            return -1
+        return int(joint_qd_start[j] - dof_base)
+
+    dof_per_world = int(model.joint_dof_count) // int(nworld)
+    axes = {"carrier_x": _dof_idx_for_key("carrier_x"), "chassis_z": _dof_idx_for_key("chassis_z"), "slip_yaw": _dof_idx_for_key("slip_yaw"), "wheel_spin": _dof_idx_for_key("wheel_spin")}
     return model, axes
 
 
