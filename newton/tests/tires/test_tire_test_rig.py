@@ -13,6 +13,32 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# NOTE (Lukas): This test created a tire test rig similar to the chrono demo, to validate correctness of 
+# newton/newton/_src/vehicle/tires/mujoco_tire_module.py
+# The plots created from this test show that the behaviour of newton + tire module closely resembles chrono tire test rig (qualitatively).
+# However, there is some mismatch, which I would attribute to numerics:
+# 1) Over time, engine vs engine differences accumulate, causing a slowly increasing difference in state and normal force.
+#    This then also affects other forces and moments.
+# 2) Chrono (and the tire module) do not implement any low-speed protection. 
+#    The slip defiinitions are not well defined/ discontinous for vx=0.
+#        abs_vx = wp.abs(vx)
+#        if abs_vx != 0.0:
+#            vsx = vx - omega * (unloaded_radius - depth)
+#            kappa = -vsx / abs_vx
+#            alpha = wp.atan2(vy, abs_vx)
+#        else:
+#            kappa = 0.0
+#            alpha = 0.0
+#   In the drop test, some small numerical noise leads to tiny vx values which causes non-zero longitudinal tire force and y-tire moment.
+#   Newton/ Mujoco on the other hand manages to keep vx exactly at zero and thus leads to zero forces.
+#   Similar behaviour can be obtained in Mujoco by setting a tiny initial speed vx=-1e-8 (which we do below). 
+#   This strongly hints that the mismatch does not come from a bug, but from numerics.    
+# Due to these effects, some tolerances in this test are quite high. 
+
+# References : 
+# chrono/src/chrono_vehicle/wheeled_vehicle/test_rig/ChTireTestRig.cpp
+# chrono/src/demos/vehicle/test_rigs/demo_VEH_TireTestRig.cpp
+
 from __future__ import annotations
 
 import math
