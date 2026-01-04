@@ -31,8 +31,9 @@
 #            alpha = 0.0
 #   In the drop mode (and before time delay in test mode), some small numerical noise leads to tiny vx values which causes non-zero longitudinal tire force and y-tire moment.
 #   Newton/ Mujoco on the other hand manages to keep vx exactly at zero and thus leads to zero forces.
-#   Similar behaviour can be obtained in Mujoco by setting a tiny initial speed vx=-1e-8 (which we do below). 
-#   This strongly hints that the mismatch does not come from a bug, but from numerics.    
+#   Similar behaviour can be obtained in Mujoco by setting a tiny initial speed vx=1e-8 (which we do below). 
+#   Setting decimation = 1 in the drop test reveals that the sign of the longitudinal forces and the y-tire moment flickers, which leads to the difference in omega and carrier_x between newton and chrono in the drop mode. 
+#   All this strongly hints that the mismatch does not come from a bug, but from numerics.    
 # Due to these effects, some tolerances in this test are quite high. 
 
 # References : 
