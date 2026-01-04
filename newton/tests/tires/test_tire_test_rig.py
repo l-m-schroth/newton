@@ -441,6 +441,7 @@ def _run_newton_rig(
     terrain_height: float,
     terrain_mu: float,
     nworld: int,
+    init_long_speed: float = 0.0,
 ) -> dict[str, np.ndarray]:
     model, axes = _build_newton_rig_model(
         tire_json=tire_json,
@@ -455,6 +456,14 @@ def _run_newton_rig(
     )
 
     state_0, state_1 = model.state(), model.state()
+    # Set initial speed for carrier_x (longitudinal degree of freedom)
+    if init_long_speed != 0.0:
+        dof_per_world = model.joint_dof_count // nworld
+        joint_qd = state_0.joint_qd.numpy()
+        for w in range(nworld):
+            joint_qd[w * dof_per_world + axes["carrier_x"]] = float(init_long_speed)
+        state_0.joint_qd.assign(joint_qd)
+        state_1.assign(state_0)
     control = model.control()
     # Call Newton collision once only to get the container for stepping, we use Mujoco colission + tire module later. 
     contacts = model.collide(state_0)
@@ -767,9 +776,9 @@ class TestTireTestRig(unittest.TestCase):
         tire_json = _chrono_data_path("vehicle/generic/tire/FialaTire.json")
         wheel_json = _chrono_data_path("vehicle/generic/wheel/WheelSimple.json")
 
-        dt = 1e-3
+        dt = 5e-4
         t_end = 1.0
-        decimate = 10
+        decimate = 20
         grav = 9.8
         normal_load = 3000.0
         camber = 0.0
@@ -821,6 +830,10 @@ class TestTireTestRig(unittest.TestCase):
                     terrain_height=terrain_height,
                     terrain_mu=terrain_mu,
                     nworld=2,
+                    # Chrono's Fiala slip computation is ill-conditioned at vx≈0 and (due to floating-point noise)
+                    # produces non-zero Fx/My even for a nominally vertical drop from rest. MuJoCo keeps vx exactly 0.
+                    # Seed a tiny initial carrier speed to get comparable low-speed behavior. 
+                    init_long_speed=-1e-8,
                 )
 
                 _save_force_moment_plots(
