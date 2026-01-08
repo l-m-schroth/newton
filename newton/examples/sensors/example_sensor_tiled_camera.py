@@ -16,7 +16,7 @@
 ###########################################################################
 # Example Tiled Camera Sensor
 #
-# Shows how to use the TiledCameraSensor class.
+# Shows how to use the SensorTiledCamera class.
 # The current view will be rendered using the Tiled Camera Sensor
 # upon pressing ENTER and displayed in the side panel.
 #
@@ -35,7 +35,7 @@ from pxr import Usd
 import newton
 import newton.examples
 import newton.usd
-from newton.sensors import TiledCameraSensor
+from newton.sensors import SensorTiledCamera
 from newton.viewer import ViewerGL
 
 SEMANTIC_COLOR_CYLINDER = 0xFFFF0000
@@ -75,27 +75,27 @@ def animate_franka(
 
 
 @wp.kernel
-def geom_id_to_semantic_rgb(
-    geom_ids: wp.array(dtype=wp.uint32, ndim=3),
+def shape_index_to_semantic_rgb(
+    shape_indices: wp.array(dtype=wp.uint32, ndim=3),
     colors: wp.array(dtype=wp.uint32),
     rgba: wp.array(dtype=wp.uint32, ndim=3),
 ):
     world_id, camera_id, pixel_id = wp.tid()
-    geom_id = geom_ids[world_id, camera_id, pixel_id]
-    if geom_id < colors.shape[0]:
-        rgba[world_id, camera_id, pixel_id] = colors[geom_id]
+    shape_index = shape_indices[world_id, camera_id, pixel_id]
+    if shape_index < colors.shape[0]:
+        rgba[world_id, camera_id, pixel_id] = colors[shape_index]
     else:
         rgba[world_id, camera_id, pixel_id] = wp.uint32(0xFF000000)
 
 
 @wp.kernel
-def geom_id_to_random_rgb(
-    geom_ids: wp.array(dtype=wp.uint32, ndim=3),
+def shape_index_to_random_rgb(
+    shape_indices: wp.array(dtype=wp.uint32, ndim=3),
     rgba: wp.array(dtype=wp.uint32, ndim=3),
 ):
     world_id, camera_id, pixel_id = wp.tid()
-    geom_id = geom_ids[world_id, camera_id, pixel_id]
-    random_color = wp.randi(wp.rand_init(12345, wp.int32(geom_id)))
+    shape_index = shape_indices[world_id, camera_id, pixel_id]
+    random_color = wp.randi(wp.rand_init(12345, wp.int32(shape_index)))
     rgba[world_id, camera_id, pixel_id] = wp.uint32(random_color) | wp.uint32(0xFF000000)
 
 
@@ -190,12 +190,12 @@ class Example:
             sensor_render_height = int(display_height // self.num_worlds_per_col)
 
         # Setup Tiled Camera Sensor
-        self.tiled_camera_sensor = TiledCameraSensor(
+        self.tiled_camera_sensor = SensorTiledCamera(
             model=self.model,
             num_cameras=1,
             width=sensor_render_width,
             height=sensor_render_height,
-            options=TiledCameraSensor.Options(
+            options=SensorTiledCamera.Options(
                 default_light=True, default_light_shadows=True, colors_per_shape=True, checkerboard_texture=True
             ),
         )
@@ -208,7 +208,7 @@ class Example:
         self.tiled_camera_sensor_color_image = self.tiled_camera_sensor.create_color_image_output()
         self.tiled_camera_sensor_depth_image = self.tiled_camera_sensor.create_depth_image_output()
         self.tiled_camera_sensor_normal_image = self.tiled_camera_sensor.create_normal_image_output()
-        self.tiled_camera_sensor_geom_id_image = self.tiled_camera_sensor.create_geom_id_image_output()
+        self.tiled_camera_sensor_shape_index_image = self.tiled_camera_sensor.create_shape_index_image_output()
 
         if isinstance(self.viewer, ViewerGL):
             self.create_texture()
@@ -245,7 +245,7 @@ class Example:
             color_image=self.tiled_camera_sensor_color_image,
             depth_image=self.tiled_camera_sensor_depth_image,
             normal_image=self.tiled_camera_sensor_normal_image,
-            geom_id_image=self.tiled_camera_sensor_geom_id_image,
+            shape_index_image=self.tiled_camera_sensor_shape_index_image,
         )
         self.update_texture()
 
@@ -314,23 +314,23 @@ class Example:
             )
         elif self.image_output == 3:
             wp.launch(
-                geom_id_to_semantic_rgb,
-                self.tiled_camera_sensor_geom_id_image.shape,
-                [self.tiled_camera_sensor_geom_id_image, self.semantic_colors],
-                [self.tiled_camera_sensor_geom_id_image],
+                shape_index_to_semantic_rgb,
+                self.tiled_camera_sensor_shape_index_image.shape,
+                [self.tiled_camera_sensor_shape_index_image, self.semantic_colors],
+                [self.tiled_camera_sensor_shape_index_image],
             )
             self.tiled_camera_sensor.flatten_color_image_to_rgba(
-                self.tiled_camera_sensor_geom_id_image, texture_buffer, self.num_worlds_per_row
+                self.tiled_camera_sensor_shape_index_image, texture_buffer, self.num_worlds_per_row
             )
         elif self.image_output == 4:
             wp.launch(
-                geom_id_to_random_rgb,
-                self.tiled_camera_sensor_geom_id_image.shape,
-                [self.tiled_camera_sensor_geom_id_image],
-                [self.tiled_camera_sensor_geom_id_image],
+                shape_index_to_random_rgb,
+                self.tiled_camera_sensor_shape_index_image.shape,
+                [self.tiled_camera_sensor_shape_index_image],
+                [self.tiled_camera_sensor_shape_index_image],
             )
             self.tiled_camera_sensor.flatten_color_image_to_rgba(
-                self.tiled_camera_sensor_geom_id_image, texture_buffer, self.num_worlds_per_row
+                self.tiled_camera_sensor_shape_index_image, texture_buffer, self.num_worlds_per_row
             )
         self.texture_buffer.unmap()
 
@@ -368,9 +368,9 @@ class Example:
             self.image_output = 1
         if ui.radio_button("Show Normal Output", self.image_output == 2):
             self.image_output = 2
-        if ui.radio_button("Show SemanticId Output", self.image_output == 3):
+        if ui.radio_button("Show Semantic Output", self.image_output == 3):
             self.image_output = 3
-        if ui.radio_button("Show GeomId Output", self.image_output == 4):
+        if ui.radio_button("Show Shape Index Output", self.image_output == 4):
             self.image_output = 4
 
     def display(self, imgui):
