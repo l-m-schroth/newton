@@ -92,7 +92,7 @@ def _mujoco_spring_damper_kernel(
     if b0 != 0:
         w0 = cvel[worldid, b0]
         omega0 = wp.spatial_top(w0)
-        vel_root0 = wp.spatial_bottom(w0)
+        vel_root0 = wp.spatial_bottom(w0) # velocity w.r.t subtree COM
         root0 = body_rootid[b0]
         subtree0 = subtree_com[worldid, root0]
         v0 = vel_root0 + wp.cross(omega0, p0_world - subtree0)

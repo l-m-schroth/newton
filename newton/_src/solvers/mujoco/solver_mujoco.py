@@ -484,7 +484,7 @@ class SolverMuJoCo(SolverBase):
         if self.mjw_model is not None:
             self.mjw_model.opt.run_collision_detection = use_mujoco_contacts
 
-        self._tire_cb_installed = False
+        self._force_cb_installed = False
         self._tire_modules: list[object] = list(tire_modules) if tire_modules is not None else []
         self._spring_damper_modules: list[object] = (
             list(spring_damper_modules) if spring_damper_modules is not None else []
@@ -530,7 +530,7 @@ class SolverMuJoCo(SolverBase):
         The wrapper clears `d.xfrc_applied` and `d.qfrc_applied` for each callback invocation (and thus each RK4 stage),
         then calls all registered modules which are expected to accumulate into the applied-force buffers.
         """
-        if self._tire_cb_installed:
+        if self._force_cb_installed: # check if callback already installed
             return
 
         wp.init()
@@ -552,7 +552,7 @@ class SolverMuJoCo(SolverBase):
                     apply(m, d)
 
         mujoco_warp.mjcb_control = _cb
-        self._tire_cb_installed = True
+        self._force_cb_installed = True
 
     def add_tire_modules(self, tire_modules: Sequence[object]) -> None:
         """Register additional Chrono-like tire modules after solver construction.
