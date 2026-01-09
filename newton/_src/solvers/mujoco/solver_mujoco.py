@@ -576,15 +576,8 @@ class SolverMuJoCo(SolverBase):
           restored at each MuJoCo-Warp `mjcb_control` invocation (including RK4 stages) so additional modules can safely
           accumulate without leaking forces across stages.
         """
-        if self._mjw_xfrc_applied_baseline is None or self._mjw_xfrc_applied_baseline.shape != d.xfrc_applied.shape:
-            d.xfrc_applied.zero_()
-        else:
-            wp.copy(d.xfrc_applied, self._mjw_xfrc_applied_baseline)
-
-        if self._mjw_qfrc_applied_baseline is None or self._mjw_qfrc_applied_baseline.shape != d.qfrc_applied.shape:
-            d.qfrc_applied.zero_()
-        else:
-            wp.copy(d.qfrc_applied, self._mjw_qfrc_applied_baseline)
+        wp.copy(d.xfrc_applied, self._mjw_xfrc_applied_baseline)
+        wp.copy(d.qfrc_applied, self._mjw_qfrc_applied_baseline)
 
     def _capture_mjwarp_applied_forces(self, d) -> None:
         """Capture baseline `xfrc_applied` / `qfrc_applied` for resetting per RK4 stage."""
@@ -643,7 +636,13 @@ class SolverMuJoCo(SolverBase):
         else:
             if self._force_cb_installed:
                 # The MuJoCo-Warp applied-force arrays are persistent; ensure a clean baseline for this step.
-                self.mjw_data.xfrc_applied.zero_()
+                # NOTE (Lukas): As far as I understand apply_mjc_control overwrites/ reset xfrc_applied and qfrc_applied only 
+                # if there is either joint-level control or external force. If both none, the values are not touched.
+                # This would mean that xfrc_applied, qfrc_applied would still be as after the previous control callback,
+                # which would cause forces to accumulate. To prevent this, we clear the forces every step.
+                # However, this clears the forces without doing it explicitely with the newton API. 
+                # In case we merge at one point, this might need some reworking. 
+                self.mjw_data.xfrc_applied.zero_() 
                 self.mjw_data.qfrc_applied.zero_()
             self.apply_mjc_control(self.model, state_in, control, self.mjw_data)
             if self.update_data_interval > 0 and self._step % self.update_data_interval == 0:
