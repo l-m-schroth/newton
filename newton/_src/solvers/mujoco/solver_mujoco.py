@@ -489,6 +489,9 @@ class SolverMuJoCo(SolverBase):
         self._spring_damper_modules: list[object] = (
             list(spring_damper_modules) if spring_damper_modules is not None else []
         )
+        # Baseline applied-force buffers for resetting at each mjcb_control invocation (RK4 stage).
+        self._mjw_xfrc_applied_baseline: wp.array | None = None
+        self._mjw_qfrc_applied_baseline: wp.array | None = None
         if (self._tire_modules or self._spring_damper_modules) and self.mjw_model is not None:
             self._disable_wheel_geom_collisions(self._tire_modules)
             self._install_control_callback()
@@ -527,21 +530,29 @@ class SolverMuJoCo(SolverBase):
     def _install_control_callback(self) -> None:
         """Install a single MuJoCo-Warp `mjcb_control` wrapper for all registered force modules.
 
-        The wrapper clears `d.xfrc_applied` and `d.qfrc_applied` for each callback invocation (and thus each RK4 stage),
-        then calls all registered modules which are expected to accumulate into the applied-force buffers.
+        The wrapper restores `d.xfrc_applied` and `d.qfrc_applied` to the baseline computed by
+        :meth:`SolverMuJoCo.apply_mjc_control` for each callback invocation (and thus each RK4 stage), then calls all
+        registered modules which are expected to accumulate into the applied-force buffers.
+
+        NOTE: `mujoco_warp.mjcb_control` is process-global. If a second SolverMuJoCo instance installs a callback, it
+        overwrites the first one; this is warned about.
         """
-        if self._force_cb_installed: # check if callback already installed
+        if self._force_cb_installed:
             return
 
         wp.init()
         _, mujoco_warp = self.import_mujoco()
         prev_cb = mujoco_warp.mjcb_control
+        if prev_cb is not None:
+            warnings.warn(
+                "MuJoCo control callback is process-global; another SolverMuJoCo has already installed `mjcb_control` "
+                "and it will now be overwritten. This may break the other solver instance.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
 
         def _cb(m, d):  # noqa: ANN001
-            d.xfrc_applied.zero_()
-            d.qfrc_applied.zero_()
-            if prev_cb is not None:
-                prev_cb(m, d)
+            self._restore_mjwarp_applied_forces(d)
             for mod in self._tire_modules:
                 apply = getattr(mod, "apply", None)
                 if apply is not None:
@@ -553,6 +564,37 @@ class SolverMuJoCo(SolverBase):
 
         mujoco_warp.mjcb_control = _cb
         self._force_cb_installed = True
+
+    def _restore_mjwarp_applied_forces(self, d) -> None:
+        """Restore MuJoCo-Warp applied-force buffers for the current callback invocation.
+
+        Reference:
+        - Baseline values are produced by :meth:`SolverMuJoCo.apply_mjc_control`, which maps Newton's `State.body_f`
+          and `Control.joint_f` into MuJoCo(-Warp) `xfrc_applied` and `qfrc_applied` using the existing kernels
+          `apply_mjc_body_f_kernel` and `apply_mjc_qfrc_kernel`.
+        - The baseline is captured once per Newton `SolverMuJoCo.step()` (see `_capture_mjwarp_applied_forces`) and then
+          restored at each MuJoCo-Warp `mjcb_control` invocation (including RK4 stages) so additional modules can safely
+          accumulate without leaking forces across stages.
+        """
+        if self._mjw_xfrc_applied_baseline is None or self._mjw_xfrc_applied_baseline.shape != d.xfrc_applied.shape:
+            d.xfrc_applied.zero_()
+        else:
+            wp.copy(d.xfrc_applied, self._mjw_xfrc_applied_baseline)
+
+        if self._mjw_qfrc_applied_baseline is None or self._mjw_qfrc_applied_baseline.shape != d.qfrc_applied.shape:
+            d.qfrc_applied.zero_()
+        else:
+            wp.copy(d.qfrc_applied, self._mjw_qfrc_applied_baseline)
+
+    def _capture_mjwarp_applied_forces(self, d) -> None:
+        """Capture baseline `xfrc_applied` / `qfrc_applied` for resetting per RK4 stage."""
+        if self._mjw_xfrc_applied_baseline is None or self._mjw_xfrc_applied_baseline.shape != d.xfrc_applied.shape:
+            self._mjw_xfrc_applied_baseline = wp.empty_like(d.xfrc_applied)
+        if self._mjw_qfrc_applied_baseline is None or self._mjw_qfrc_applied_baseline.shape != d.qfrc_applied.shape:
+            self._mjw_qfrc_applied_baseline = wp.empty_like(d.qfrc_applied)
+
+        wp.copy(self._mjw_xfrc_applied_baseline, d.xfrc_applied)
+        wp.copy(self._mjw_qfrc_applied_baseline, d.qfrc_applied)
 
     def add_tire_modules(self, tire_modules: Sequence[object]) -> None:
         """Register additional Chrono-like tire modules after solver construction.
@@ -599,10 +641,16 @@ class SolverMuJoCo(SolverBase):
             self._mujoco.mj_step(self.mj_model, self.mj_data)
             self.update_newton_state(self.model, state_out, self.mj_data)
         else:
+            if self._force_cb_installed:
+                # The MuJoCo-Warp applied-force arrays are persistent; ensure a clean baseline for this step.
+                self.mjw_data.xfrc_applied.zero_()
+                self.mjw_data.qfrc_applied.zero_()
             self.apply_mjc_control(self.model, state_in, control, self.mjw_data)
             if self.update_data_interval > 0 and self._step % self.update_data_interval == 0:
                 self.update_mjc_data(self.mjw_data, self.model, state_in)
             self.mjw_model.opt.timestep.fill_(dt)
+            if self._force_cb_installed:
+                self._capture_mjwarp_applied_forces(self.mjw_data)
             with wp.ScopedDevice(self.model.device):
                 if self.mjw_model.opt.run_collision_detection:
                     self.mujoco_warp_step()
