@@ -40,6 +40,10 @@ from newton._src.vehicle.tires import MujocoFialaTireModule  # noqa: E402
 from newton._src.vehicle.tires.disc_terrain_collision import CollisionType  # noqa: E402
 from newton.solvers import SolverMuJoCo  # noqa: E402
 
+if wp.config.kernel_cache_dir != os.environ["WARP_CACHE_PATH"]:
+    Path(os.environ["WARP_CACHE_PATH"]).mkdir(parents=True, exist_ok=True)
+    wp.config.kernel_cache_dir = os.environ["WARP_CACHE_PATH"]
+
 
 def _chrono_tire_path(rel: str) -> str:
     return str(_REPO_ROOT / "chrono" / "build" / "data" / rel)

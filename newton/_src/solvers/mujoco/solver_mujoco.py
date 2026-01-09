@@ -370,6 +370,7 @@ class SolverMuJoCo(SolverBase):
         include_sites: bool = True,
         tire_modules: Sequence[object] | None = None,
         spring_damper_modules: Sequence[object] | None = None,
+        anti_roll_bar_modules: Sequence[object] | None = None,
     ):
         """
         Args:
@@ -401,6 +402,8 @@ class SolverMuJoCo(SolverBase):
                 `mujoco_warp.mjcb_control`. When provided, wheel geoms can be disabled from MuJoCo contact handling by
                 exposing `wheel_body_ids` on the module.
             spring_damper_modules (Sequence[object] | None): Optional MuJoCo-Warp force modules for spring-dampers,
+                applied via the same `mujoco_warp.mjcb_control` wrapper as `tire_modules`.
+            anti_roll_bar_modules (Sequence[object] | None): Optional MuJoCo-Warp force modules for anti-roll bars,
                 applied via the same `mujoco_warp.mjcb_control` wrapper as `tire_modules`.
         """
         super().__init__(model)
@@ -489,10 +492,13 @@ class SolverMuJoCo(SolverBase):
         self._spring_damper_modules: list[object] = (
             list(spring_damper_modules) if spring_damper_modules is not None else []
         )
+        self._anti_roll_bar_modules: list[object] = (
+            list(anti_roll_bar_modules) if anti_roll_bar_modules is not None else []
+        )
         # Baseline applied-force buffers for resetting at each mjcb_control invocation (RK4 stage).
         self._mjw_xfrc_applied_baseline: wp.array | None = None
         self._mjw_qfrc_applied_baseline: wp.array | None = None
-        if (self._tire_modules or self._spring_damper_modules) and self.mjw_model is not None:
+        if (self._tire_modules or self._spring_damper_modules or self._anti_roll_bar_modules) and self.mjw_model is not None:
             self._disable_wheel_geom_collisions(self._tire_modules)
             self._install_control_callback()
 
@@ -561,6 +567,10 @@ class SolverMuJoCo(SolverBase):
                 apply = getattr(mod, "apply", None)
                 if apply is not None:
                     apply(m, d)
+            for mod in self._anti_roll_bar_modules:
+                apply = getattr(mod, "apply", None)
+                if apply is not None:
+                    apply(m, d)
 
         mujoco_warp.mjcb_control = _cb
         self._force_cb_installed = True
@@ -618,6 +628,19 @@ class SolverMuJoCo(SolverBase):
         self._spring_damper_modules.extend(spring_damper_modules)
         self._install_control_callback()
 
+    def add_anti_roll_bar_modules(self, anti_roll_bar_modules: Sequence[object]) -> None:
+        """Register anti-roll bar force modules after solver construction.
+
+        The modules are chained into the global MuJoCo-Warp `mjcb_control` callback. See `_install_control_callback` for
+        the required accumulation semantics.
+        """
+        if not anti_roll_bar_modules:
+            return
+        if self.use_mujoco_cpu or self.mjw_model is None:
+            raise ValueError("add_anti_roll_bar_modules requires the mujoco_warp backend (use_mujoco_cpu=False).")
+
+        self._anti_roll_bar_modules.extend(anti_roll_bar_modules)
+        self._install_control_callback()
     @event_scope
     def mujoco_warp_step(self):
         self._mujoco_warp.step(self.mjw_model, self.mjw_data)
