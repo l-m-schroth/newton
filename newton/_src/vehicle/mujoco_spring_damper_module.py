@@ -123,6 +123,12 @@ def _mujoco_spring_damper_kernel(
 @dataclasses.dataclass(slots=True)
 class MujocoSpringDamperModule:
     """Spring-damper force elements applied via MuJoCo-Warp `mjcb_control`.
+    Note that in Mujoco, typically tendons can be used to directly get spring-damper forces between different body sites.
+    However, as tendons are not really supported in the newton modelBuilder yet, I decided to add this module. 
+    Also, we anyways might want to improve the spring-damper forces with non-linear spring laws later, 
+    so adding the forces via a custom model allows us to easily improve the simulation by replacing the spring law. 
+    Also, Mujoco tendons damping are not properly considered during implicit integration anyways (only joint damping is considered), so it probably does not make a numerical difference
+    to using mujoco's build in tendons (Reference: https://mujoco.readthedocs.io/en/stable/computation/index.html)
 
     The module accumulates applied wrenches into `d.xfrc_applied` (world-frame force/torque), so it can be chained with
     other force modules (e.g., tires) as long as the callback clears the applied-force buffers each invocation.

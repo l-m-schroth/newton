@@ -95,7 +95,7 @@ class TestMujocoSpringDamperModule(unittest.TestCase):
         m = mujoco_warp.put_model(mjm)
         d = mujoco_warp.put_data(mjm, mjd, nworld=2)
 
-        body_mass = float(mjm.body_mass[1])
+        body_mass = float(mjm.body_mass[1]) # NOTE (Lukas): World-body has id 0, mass has body id 1.
         g = abs(float(mjm.opt.gravity[2]))
         k = 1000.0
         c = 20.0
@@ -219,8 +219,8 @@ class TestMujocoSpringDamperModule(unittest.TestCase):
         any_contact = False
         for _ in range(1000):
             mujoco_warp.step(m, d)
-            in_contact = tire._in_contact  # noqa: SLF001
-            self.assertIsNotNone(in_contact)
+            in_contact = tire._in_contact  # noqa: SLF001 
+            self.assertIsNotNone(in_contact) # NOTE (Lukas): Make sure that the tire module actually allocates in_contact
             if int(in_contact.numpy().max()) != 0:
                 any_contact = True
                 break
