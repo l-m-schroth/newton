@@ -108,7 +108,6 @@ def _mujoco_apply_tire_wrenches_kernel(
     bodyid = wheel_body_ids[wheel_idx]
 
     if in_contact[tid] == 0:
-        xfrc_applied_out[worldid, bodyid] = wp.spatial_vector(wp.vec3(0.0, 0.0, 0.0), wp.vec3(0.0, 0.0, 0.0))
         return
 
     cx = contact_x[tid]
@@ -123,7 +122,7 @@ def _mujoco_apply_tire_wrenches_kernel(
     r = (contact_pos[tid] + depth[tid] * cz) - disc_center
     moment_world = moment_world + wp.cross(r, force_world)
 
-    xfrc_applied_out[worldid, bodyid] = wp.spatial_vector(force_world, moment_world)
+    wp.atomic_add(xfrc_applied_out, worldid, bodyid, wp.spatial_vector(force_world, moment_world))
 
 
 @dataclasses.dataclass(slots=True)
@@ -280,7 +279,7 @@ class MujocoFialaTireModule:
         self._checked_terrain_geom_type = True
 
     def apply(self, m, d) -> None:
-        """Compute and write wheel `xfrc_applied` for the current MuJoCo-Warp state."""
+        """Compute and accumulate wheel `xfrc_applied` for the current MuJoCo-Warp state."""
         wp.init()
         device = d.xfrc_applied.device
         self._ensure_device_arrays(device)

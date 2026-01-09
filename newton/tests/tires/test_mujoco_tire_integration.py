@@ -251,7 +251,14 @@ class TestMujocoWarpFialaTireIntegration(unittest.TestCase):
                     terrain_geom_name="ground",
                     collision_type=method,
                 )
-                mujoco_warp.mjcb_control = module.apply
+
+                def _cb(m_cb, d_cb):  # noqa: ANN001
+                    wp.init()
+                    d_cb.xfrc_applied.zero_()
+                    d_cb.qfrc_applied.zero_()
+                    module.apply(m_cb, d_cb)
+
+                mujoco_warp.mjcb_control = _cb
                 mujoco_warp.forward(m, d)
 
                 xipos = d.xipos.numpy()
@@ -383,7 +390,14 @@ class TestMujocoWarpFialaTireIntegration(unittest.TestCase):
                     terrain_geom_name="ground",
                     collision_type=method,
                 )
-                mujoco_warp.mjcb_control = module.apply
+
+                def _cb(m_cb, d_cb):  # noqa: ANN001
+                    wp.init()
+                    d_cb.xfrc_applied.zero_()
+                    d_cb.qfrc_applied.zero_()
+                    module.apply(m_cb, d_cb)
+
+                mujoco_warp.mjcb_control = _cb
                 mujoco_warp.forward(m, d)
 
                 xipos = d.xipos.numpy()

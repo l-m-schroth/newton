@@ -43,3 +43,8 @@ asv/html
 MUJOCO_LOG.TXT
 imgui.ini
 newton/tests/outputs/
+
+# (Lukas): leave unfininshed stuff out
+newton/examples/robot/vehicles/vehicle_rsl_improve_steering_suspension.py
+newton/examples/robot/example_vehicle_g_class.py
+newton/examples/robot/vehicles/__init__.py

@@ -369,6 +369,7 @@ class SolverMuJoCo(SolverBase):
         ls_tolerance: float = 0.01,
         include_sites: bool = True,
         tire_modules: Sequence[object] | None = None,
+        spring_damper_modules: Sequence[object] | None = None,
     ):
         """
         Args:
@@ -396,6 +397,11 @@ class SolverMuJoCo(SolverBase):
             tolerance (float | None): Solver tolerance for early termination of the iterative solver. Defaults to 1e-6 and will be increased to 1e-6 by the MuJoCo solver if a smaller value is provided.
             ls_tolerance (float | None): Solver tolerance for early termination of the line search. Defaults to 0.01.
             include_sites (bool): If ``True`` (default), Newton shapes marked with ``ShapeFlags.SITE`` are exported as MuJoCo sites. Sites are non-colliding reference points used for sensor attachment, debugging, or as frames of reference. If ``False``, sites are skipped during export. Defaults to ``True``.
+            tire_modules (Sequence[object] | None): Optional MuJoCo-Warp force modules (e.g. tire models) applied via
+                `mujoco_warp.mjcb_control`. When provided, wheel geoms can be disabled from MuJoCo contact handling by
+                exposing `wheel_body_ids` on the module.
+            spring_damper_modules (Sequence[object] | None): Optional MuJoCo-Warp force modules for spring-dampers,
+                applied via the same `mujoco_warp.mjcb_control` wrapper as `tire_modules`.
         """
         super().__init__(model)
         # Import and cache MuJoCo modules (only happens once per class)
@@ -480,53 +486,73 @@ class SolverMuJoCo(SolverBase):
 
         self._tire_cb_installed = False
         self._tire_modules: list[object] = list(tire_modules) if tire_modules is not None else []
-        if self._tire_modules and self.mjw_model is not None:
-            # If tire modules are provided, install a Chrono-like tire force route via mjcb_control.
-            #
-            # The recommended usage is to disable wheel geoms from MuJoCo contact handling, so tire-ground
-            # interaction is handled purely via external forces (xfrc_applied) in the callback.
-            wheel_body_ids: list[int] = []
+        self._spring_damper_modules: list[object] = (
+            list(spring_damper_modules) if spring_damper_modules is not None else []
+        )
+        if (self._tire_modules or self._spring_damper_modules) and self.mjw_model is not None:
+            self._disable_wheel_geom_collisions(self._tire_modules)
+            self._install_control_callback()
+
+    def _disable_wheel_geom_collisions(self, tire_modules: Sequence[object]) -> None:
+        if not tire_modules or self.mjw_model is None:
+            return
+
+        wheel_body_ids: list[int] = []
+        for mod in tire_modules:
+            wheel_ids = getattr(mod, "wheel_body_ids", None)
+            if wheel_ids is None:
+                continue
+            wheel_body_ids.extend(int(x) for x in wheel_ids)
+
+        wheel_body_ids = sorted(set(wheel_body_ids))
+        if not wheel_body_ids:
+            return
+
+        wheel_body_ids_wp = wp.array(wheel_body_ids, dtype=wp.int32, device=self.model.device)
+        wp.launch(
+            _disable_geom_collisions_for_bodies_kernel,
+            dim=self.mjw_model.ngeom,
+            inputs=[
+                self.mjw_model.geom_bodyid,
+                wheel_body_ids_wp,
+                int(len(wheel_body_ids)),
+            ],
+            outputs=[
+                self.mjw_model.geom_contype,
+                self.mjw_model.geom_conaffinity,
+            ],
+            device=self.model.device,
+        )
+
+    def _install_control_callback(self) -> None:
+        """Install a single MuJoCo-Warp `mjcb_control` wrapper for all registered force modules.
+
+        The wrapper clears `d.xfrc_applied` and `d.qfrc_applied` for each callback invocation (and thus each RK4 stage),
+        then calls all registered modules which are expected to accumulate into the applied-force buffers.
+        """
+        if self._tire_cb_installed:
+            return
+
+        wp.init()
+        _, mujoco_warp = self.import_mujoco()
+        prev_cb = mujoco_warp.mjcb_control
+
+        def _cb(m, d):  # noqa: ANN001
+            d.xfrc_applied.zero_()
+            d.qfrc_applied.zero_()
+            if prev_cb is not None:
+                prev_cb(m, d)
             for mod in self._tire_modules:
-                wheel_ids = getattr(mod, "wheel_body_ids", None)
-                if wheel_ids is None:
-                    continue
-                wheel_body_ids.extend(int(x) for x in wheel_ids)
+                apply = getattr(mod, "apply", None)
+                if apply is not None:
+                    apply(m, d)
+            for mod in self._spring_damper_modules:
+                apply = getattr(mod, "apply", None)
+                if apply is not None:
+                    apply(m, d)
 
-            wheel_body_ids = sorted(set(wheel_body_ids))
-            if wheel_body_ids:
-                wheel_body_ids_wp = wp.array(wheel_body_ids, dtype=wp.int32, device=self.model.device)
-                wp.launch(
-                    _disable_geom_collisions_for_bodies_kernel,
-                    dim=self.mjw_model.ngeom,
-                    inputs=[
-                        self.mjw_model.geom_bodyid,
-                        wheel_body_ids_wp,
-                        int(len(wheel_body_ids)),
-                    ],
-                    outputs=[
-                        self.mjw_model.geom_contype,
-                        self.mjw_model.geom_conaffinity,
-                    ],
-                    device=self.model.device,
-                )
-
-            # Install the MuJoCo-Warp control callback once (global `mujoco_warp.mjcb_control`).
-            #
-            # This callback is evaluated during `forward()` and therefore also for each RK4 stage.
-            # We intentionally do not reassign it each step for performance and to avoid hiding failures.
-            _, mujoco_warp = self.import_mujoco()
-            prev_cb = mujoco_warp.mjcb_control
-
-            def _cb(m, d):  # noqa: ANN001
-                if prev_cb is not None:
-                    prev_cb(m, d)
-                for mod in self._tire_modules:
-                    apply = getattr(mod, "apply", None)
-                    if apply is not None:
-                        apply(m, d)
-
-            mujoco_warp.mjcb_control = _cb
-            self._tire_cb_installed = True
+        mujoco_warp.mjcb_control = _cb
+        self._tire_cb_installed = True
 
     def add_tire_modules(self, tire_modules: Sequence[object]) -> None:
         """Register additional Chrono-like tire modules after solver construction.
@@ -540,46 +566,22 @@ class SolverMuJoCo(SolverBase):
             raise ValueError("add_tire_modules requires the mujoco_warp backend (use_mujoco_cpu=False).")
 
         self._tire_modules.extend(tire_modules)
+        self._disable_wheel_geom_collisions(tire_modules)
+        self._install_control_callback()
 
-        wheel_body_ids: list[int] = []
-        for mod in tire_modules:
-            wheel_ids = getattr(mod, "wheel_body_ids", None)
-            if wheel_ids is None:
-                continue
-            wheel_body_ids.extend(int(x) for x in wheel_ids)
+    def add_spring_damper_modules(self, spring_damper_modules: Sequence[object]) -> None:
+        """Register spring-damper force modules after solver construction.
 
-        wheel_body_ids = sorted(set(wheel_body_ids))
-        if wheel_body_ids:
-            wheel_body_ids_wp = wp.array(wheel_body_ids, dtype=wp.int32, device=self.model.device)
-            wp.launch(
-                _disable_geom_collisions_for_bodies_kernel,
-                dim=self.mjw_model.ngeom,
-                inputs=[
-                    self.mjw_model.geom_bodyid,
-                    wheel_body_ids_wp,
-                    int(len(wheel_body_ids)),
-                ],
-                outputs=[
-                    self.mjw_model.geom_contype,
-                    self.mjw_model.geom_conaffinity,
-                ],
-                device=self.model.device,
-            )
+        The modules are chained into the global MuJoCo-Warp `mjcb_control` callback. See `_install_control_callback` for
+        the required accumulation semantics.
+        """
+        if not spring_damper_modules:
+            return
+        if self.use_mujoco_cpu or self.mjw_model is None:
+            raise ValueError("add_spring_damper_modules requires the mujoco_warp backend (use_mujoco_cpu=False).")
 
-        if not self._tire_cb_installed:
-            _, mujoco_warp = self.import_mujoco()
-            prev_cb = mujoco_warp.mjcb_control
-
-            def _cb(m, d):  # noqa: ANN001
-                if prev_cb is not None:
-                    prev_cb(m, d)
-                for mod in self._tire_modules:
-                    apply = getattr(mod, "apply", None)
-                    if apply is not None:
-                        apply(m, d)
-
-            mujoco_warp.mjcb_control = _cb
-            self._tire_cb_installed = True
+        self._spring_damper_modules.extend(spring_damper_modules)
+        self._install_control_callback()
 
     @event_scope
     def mujoco_warp_step(self):
