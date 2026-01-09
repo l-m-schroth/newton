@@ -45,12 +45,22 @@ def _chrono_tire_path(rel: str) -> str:
     return str(_REPO_ROOT / "chrono" / "build" / "data" / rel)
 
 
-def _make_dummy_newton_model() -> newton.Model:
-    builder = newton.ModelBuilder()
-    link = builder.add_link(mass=1.0, com=wp.vec3(0.0, 0.0, 0.0), I_m=wp.mat33(np.eye(3)))
-    joint = builder.add_joint_revolute(-1, link)
-    builder.add_articulation([joint])
-    return builder.finalize()
+def _build_world_from_mjcf(xml: str, *, gravity: float) -> newton.ModelBuilder:
+    """Parse a minimal MJCF into a Newton world builder.
+
+    We set `ignore_inertial_definitions=False` because these MJCF snippets intentionally omit collision geometry and
+    rely on explicit `<inertial ...>` tags to define mass/inertia.
+    """
+    b = newton.ModelBuilder(up_axis=newton.Axis.Z, gravity=-float(gravity))
+    b.add_mjcf(
+        xml,
+        ignore_inertial_definitions=False,
+        ensure_nonstatic_links=False,
+        parse_sites=True,
+        parse_visuals=False,
+        parse_meshes=False,
+    )
+    return b
 
 
 def _save_mass_trajectory_plot(path: Path, t: np.ndarray, xyz: np.ndarray) -> None:
@@ -78,25 +88,9 @@ class TestMujocoSpringDamperModule(unittest.TestCase):
         mujoco_warp.mj_resetCallbacks()
 
     def test_mass_on_vertical_spring_converges_to_static_equilibrium_nworld_2(self):
-        xml = r"""
-<mujoco model="mass_on_spring">
-  <option timestep="0.001" integrator="Euler" gravity="0 0 -9.81"/>
-  <worldbody>
-    <body name="mass" pos="0 0 0.8">
-      <freejoint/>
-      <inertial pos="0 0 0" mass="1" diaginertia="0.01 0.01 0.01"/>
-    </body>
-  </worldbody>
-</mujoco>
-"""
-        mjm = mujoco.MjModel.from_xml_string(xml)
-        mjd = mujoco.MjData(mjm)
-
-        m = mujoco_warp.put_model(mjm)
-        d = mujoco_warp.put_data(mjm, mjd, nworld=2)
-
-        body_mass = float(mjm.body_mass[1]) # NOTE (Lukas): World-body has id 0, mass has body id 1.
-        g = abs(float(mjm.opt.gravity[2]))
+        gravity = 9.81
+        body_mass = 1.0
+        g = gravity
         k = 1000.0
         c = 20.0
         z_anchor = 1.0
@@ -105,12 +99,51 @@ class TestMujocoSpringDamperModule(unittest.TestCase):
         # Equilibrium: k*(L-L0) = m*g, L = z_anchor - z_eq.
         z_eq = z_anchor - (L0 + body_mass * g / k)
 
-        qpos = d.qpos.numpy()
-        qpos[0, 2] = z_eq + 0.2
-        qpos[1, 2] = z_eq - 0.1
-        d.qpos = wp.array(qpos, dtype=float, device=d.qpos.device)
+        xml0 = f"""
+<mujoco model="mass_on_spring">
+  <option timestep="0.001" integrator="Euler" gravity="0 0 -{gravity}"/>
+  <worldbody>
+    <body name="mass" pos="0 0 {z_eq + 0.2}">
+      <freejoint/>
+      <inertial pos="0 0 0" mass="1" diaginertia="0.01 0.01 0.01"/>
+    </body>
+  </worldbody>
+</mujoco>
+"""
+        xml1 = f"""
+<mujoco model="mass_on_spring">
+  <option timestep="0.001" integrator="Euler" gravity="0 0 -{gravity}"/>
+  <worldbody>
+    <body name="mass" pos="0 0 {z_eq - 0.1}">
+      <freejoint/>
+      <inertial pos="0 0 0" mass="1" diaginertia="0.01 0.01 0.01"/>
+    </body>
+  </worldbody>
+</mujoco>
+"""
 
-        body_id = int(mujoco.mj_name2id(mjm, mujoco.mjtObj.mjOBJ_BODY, "mass"))
+        main = newton.ModelBuilder(up_axis=newton.Axis.Z, gravity=-float(gravity))
+        w0 = _build_world_from_mjcf(xml0, gravity=gravity)
+        w1 = _build_world_from_mjcf(xml1, gravity=gravity)
+        # Add a world-local site to ensure `separate_worlds=True` has a per-world shape for selecting a template world.
+        for w in (w0, w1):
+            if "mass" in w.body_key:
+                mass_idx = w.body_key.index("mass")
+                w.add_shape_sphere(body=mass_idx, radius=0.01, as_site=True, key="mass_site")
+        main.add_world(w0)
+        main.add_world(w1)
+        model = main.finalize()
+        nworld = int(model.num_worlds)
+        body_world = model.body_world.numpy()
+        body_indices = [int(np.nonzero(body_world == w)[0][0]) for w in range(nworld)]
+        self.assertEqual(len(body_indices), 2)
+
+        state_0, state_1 = model.state(), model.state()
+        control = model.control()
+        contacts = model.collide(state_0)
+
+        solver = SolverMuJoCo(model, use_mujoco_contacts=True, integrator="euler", update_data_interval=0)
+        body_id = int(mujoco.mj_name2id(solver.mj_model, mujoco.mjtObj.mjOBJ_BODY, "mass"))
 
         module = MujocoSpringDamperModule(
             springs=[
@@ -126,10 +159,9 @@ class TestMujocoSpringDamperModule(unittest.TestCase):
             ]
         )
 
-        solver = SolverMuJoCo(_make_dummy_newton_model(), mjw_model=m, mjw_data=d, update_data_interval=0)
         solver.add_spring_damper_modules([module])
 
-        dt = float(mjm.opt.timestep)
+        dt = 0.001
         steps = 3000
         decimate = 10
 
@@ -137,10 +169,16 @@ class TestMujocoSpringDamperModule(unittest.TestCase):
         xyz_hist: list[np.ndarray] = []
 
         for step in range(steps):
-            mujoco_warp.step(m, d)
+            solver.step(state_0, state_1, control, contacts, dt)
+            state_0, state_1 = state_1, state_0
             if step % decimate == 0:
                 times.append(step * dt)
-                xyz_hist.append(d.xipos.numpy()[:, body_id].copy())
+                body_q = state_0.body_q.numpy()
+                xyz_world = np.zeros((nworld, 3), dtype=np.float64)
+                for w in range(nworld):
+                    bi = body_indices[w]
+                    xyz_world[w, :] = body_q[bi, 0:3]
+                xyz_hist.append(xyz_world)
 
         t = np.asarray(times)
         xyz = np.asarray(xyz_hist)
@@ -149,7 +187,11 @@ class TestMujocoSpringDamperModule(unittest.TestCase):
         plot_dir.mkdir(parents=True, exist_ok=True)
         _save_mass_trajectory_plot(plot_dir / "mass_on_vertical_spring_nworld2.png", t, xyz)
 
-        final_xyz = d.xipos.numpy()[:, body_id]
+        body_q = state_0.body_q.numpy()
+        final_xyz = np.zeros((nworld, 3), dtype=np.float64)
+        for w in range(nworld):
+            bi = body_indices[w]
+            final_xyz[w, :] = body_q[bi, 0:3]
         for world in range(2):
             self.assertAlmostEqual(float(final_xyz[world, 0]), 0.0, places=3)
             self.assertAlmostEqual(float(final_xyz[world, 1]), 0.0, places=3)
@@ -157,38 +199,49 @@ class TestMujocoSpringDamperModule(unittest.TestCase):
 
     def test_spring_damper_chains_with_tire_module_and_no_contact_forces(self):
         tire_json = _chrono_tire_path("vehicle/generic/tire/FialaTire.json")
-
-        xml = r"""
-<mujoco model="wheel_on_spring_no_contact">
-  <option timestep="0.001" integrator="Euler" gravity="0 0 -9.81"/>
-  <worldbody>
-    <geom name="ground" type="plane" size="5 5 0.1" friction="0.8 0 0"/>
-    <body name="wheel" pos="0 0 0.55">
-      <freejoint/>
-      <inertial pos="0 0 0" mass="10" diaginertia="1.0 1.0 1.0"/>
-    </body>
-  </worldbody>
-</mujoco>
-"""
-        mjm = mujoco.MjModel.from_xml_string(xml)
-        mjd = mujoco.MjData(mjm)
-
-        m = mujoco_warp.put_model(mjm)
-        d = mujoco_warp.put_data(mjm, mjd, nworld=2)
-
-        wheel_body_id = int(mujoco.mj_name2id(mjm, mujoco.mjtObj.mjOBJ_BODY, "wheel"))
-
-        body_mass = float(mjm.body_mass[wheel_body_id])
-        g = abs(float(mjm.opt.gravity[2]))
+        gravity = 9.81
+        g = gravity
         k = 10000.0
         c = 50.0
         z_anchor = 1.0
         z_eq = 0.55
+        body_mass = 10.0
         L0 = (z_anchor - z_eq) - body_mass * g / k
 
-        qpos = d.qpos.numpy()
-        qpos[:, 2] = z_eq
-        d.qpos = wp.array(qpos, dtype=float, device=d.qpos.device)
+        xml = f"""
+<mujoco model="wheel_on_spring_no_contact">
+  <option timestep="0.001" integrator="Euler" gravity="0 0 -{gravity}"/>
+  <worldbody>
+    <geom name="ground" type="plane" size="5 5 0.1" friction="0.8 0 0"/>
+    <body name="wheel" pos="0 0 {z_eq}">
+      <freejoint/>
+      <inertial pos="0 0 0" mass="{body_mass}" diaginertia="1.0 1.0 1.0"/>
+    </body>
+  </worldbody>
+</mujoco>
+"""
+        main = newton.ModelBuilder(up_axis=newton.Axis.Z, gravity=-float(gravity))
+        main.add_world(_build_world_from_mjcf(xml, gravity=gravity))
+        main.add_world(_build_world_from_mjcf(xml, gravity=gravity))
+        model = main.finalize()
+        nworld = int(model.num_worlds)
+        body_world = model.body_world.numpy()
+        body_indices = [int(np.nonzero(body_world == w)[0][0]) for w in range(nworld)]
+        self.assertEqual(len(body_indices), 2)
+
+        state_0, state_1 = model.state(), model.state()
+        control = model.control()
+        contacts = model.collide(state_0)
+        solver = SolverMuJoCo(model, use_mujoco_contacts=True, integrator="euler", update_data_interval=0)
+
+        wheel_body_id = int(mujoco.mj_name2id(solver.mj_model, mujoco.mjtObj.mjOBJ_BODY, "wheel"))
+        terrain_geom_name = "ground"
+        for gid in range(int(solver.mj_model.ngeom)):
+            if int(solver.mj_model.geom_type[gid]) == int(mujoco.mjtGeom.mjGEOM_PLANE):
+                name = mujoco.mj_id2name(solver.mj_model, mujoco.mjtObj.mjOBJ_GEOM, gid)
+                if name is not None:
+                    terrain_geom_name = str(name)
+                break
 
         spring = MujocoSpringDamperModule(
             springs=[
@@ -205,27 +258,31 @@ class TestMujocoSpringDamperModule(unittest.TestCase):
         )
 
         tire = MujocoFialaTireModule.from_mujoco_names(
-            mjm,
+            solver.mj_model,
             tire_json,
             wheel_body_names=["wheel"],
-            terrain_geom_name="ground",
+            terrain_geom_name=terrain_geom_name,
             collision_type=CollisionType.SINGLE_POINT,
         )
 
-        solver = SolverMuJoCo(_make_dummy_newton_model(), mjw_model=m, mjw_data=d, update_data_interval=0)
         solver.add_tire_modules([tire])
         solver.add_spring_damper_modules([spring])
 
         any_contact = False
         for _ in range(1000):
-            mujoco_warp.step(m, d)
-            in_contact = tire._in_contact  # noqa: SLF001 
-            self.assertIsNotNone(in_contact) # NOTE (Lukas): Make sure that the tire module actually allocates in_contact
+            solver.step(state_0, state_1, control, contacts, 0.001)
+            state_0, state_1 = state_1, state_0
+            in_contact = tire._in_contact  # noqa: SLF001
+            self.assertIsNotNone(in_contact)  # NOTE (Lukas): Make sure that the tire module actually allocates in_contact
             if int(in_contact.numpy().max()) != 0:
                 any_contact = True
                 break
 
-        wheel_z = d.xipos.numpy()[:, wheel_body_id, 2]
+        body_q = state_0.body_q.numpy()
+        wheel_z = np.zeros((nworld,), dtype=np.float64)
+        for w in range(nworld):
+            bi = body_indices[w]
+            wheel_z[w] = float(body_q[bi, 2])
         self.assertAlmostEqual(float(wheel_z[0]), z_eq, delta=2.0e-3)
         self.assertAlmostEqual(float(wheel_z[1]), z_eq, delta=2.0e-3)
         self.assertFalse(any_contact, "wheel should remain above the ground (no disc-terrain contact)")
