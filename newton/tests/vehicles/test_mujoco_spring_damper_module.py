@@ -99,7 +99,7 @@ class TestMujocoSpringDamperModule(unittest.TestCase):
         # Equilibrium: k*(L-L0) = m*g, L = z_anchor - z_eq.
         z_eq = z_anchor - (L0 + body_mass * g / k)
 
-        xml0 = f"""
+        xml = f"""
 <mujoco model="mass_on_spring">
   <option timestep="0.001" integrator="Euler" gravity="0 0 -{gravity}"/>
   <worldbody>
@@ -110,21 +110,9 @@ class TestMujocoSpringDamperModule(unittest.TestCase):
   </worldbody>
 </mujoco>
 """
-        xml1 = f"""
-<mujoco model="mass_on_spring">
-  <option timestep="0.001" integrator="Euler" gravity="0 0 -{gravity}"/>
-  <worldbody>
-    <body name="mass" pos="0 0 {z_eq - 0.1}">
-      <freejoint/>
-      <inertial pos="0 0 0" mass="1" diaginertia="0.01 0.01 0.01"/>
-    </body>
-  </worldbody>
-</mujoco>
-"""
-
         main = newton.ModelBuilder(up_axis=newton.Axis.Z, gravity=-float(gravity))
-        w0 = _build_world_from_mjcf(xml0, gravity=gravity)
-        w1 = _build_world_from_mjcf(xml1, gravity=gravity)
+        w0 = _build_world_from_mjcf(xml, gravity=gravity) # two worlds
+        w1 = _build_world_from_mjcf(xml, gravity=gravity)
         # Add a world-local site to ensure `separate_worlds=True` has a per-world shape for selecting a template world.
         for w in (w0, w1):
             if "mass" in w.body_key:
