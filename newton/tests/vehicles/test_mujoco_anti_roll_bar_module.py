@@ -86,11 +86,10 @@ class TestMujocoAntiRollBarModule(unittest.TestCase):
         mujoco_warp.mj_resetCallbacks()
 
     def test_static_anti_roll_equilibrium_nworld_2(self):
-        # Two independent 1-DOF suspension coordinates (no gravity, no contacts). The anti-roll bar applies equal/opposite
-        # generalized forces, so the sum coordinate (q_FL + q_FR) should remain constant over time.
+        # Two independent 1-DOF suspension coordinates (no gravity, no contacts).
         a = 0.2
         k = 200.0
-        b = 20.0
+        b = 10.0
 
         main = newton.ModelBuilder(up_axis=newton.Axis.Z, gravity=0.0)
         w0 = _build_suspension_world()
@@ -147,6 +146,8 @@ class TestMujocoAntiRollBarModule(unittest.TestCase):
             damping=b,
         )
         solver.add_anti_roll_bar_modules([module])
+        # Ensure the non-zero Newton initial state is propagated into the underlying MuJoCo(-Warp) state.
+        solver.update_mjc_data(solver.mjw_data, model, state_0)
 
         dt = 0.002
         steps = int(4.0 / dt)
@@ -194,6 +195,8 @@ class TestMujocoAntiRollBarModule(unittest.TestCase):
         self.assertLess(abs(float(l_final[0])), 2.0e-3)
         self.assertLess(abs(float(l_final[1])), 2.0e-3)
 
+        # The anti-roll bar applies equal/opposite generalized forces, 
+        # so the sum coordinate (q_FL + q_FR) should remain constant over time.
         qsum = q_fl + q_fr
         qsum0 = qsum[0, :]
         max_dev = np.max(np.abs(qsum - qsum0[None, :]), axis=0)

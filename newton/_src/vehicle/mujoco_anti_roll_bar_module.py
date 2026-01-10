@@ -137,7 +137,9 @@ class MujocoAntiRollBarModule:
     _b_wp: wp.array | None = None
 
     @classmethod
-    def from_mujoco_names(
+    def from_mujoco_names( 
+        # NOTE: from_mujoco_names currently only supports creating modules with a single ARB. 
+        # The kernel can handle multiple ARB's in the same module. Hence from_mujoco_names could be generalized to multi ARB support.
         cls,
         mj_model,
         *,
@@ -159,7 +161,7 @@ class MujocoAntiRollBarModule:
         qpos_l, dof_l = _resolve_1dof_joint_qpos_dof(mj_model, jl, joint_name=str(joint_left_name))
         qpos_r, dof_r = _resolve_1dof_joint_qpos_dof(mj_model, jr, joint_name=str(joint_right_name))
 
-        return cls(
+        return cls( 
             bars=(
                 AntiRollBar(
                     qpos_left=qpos_l,
